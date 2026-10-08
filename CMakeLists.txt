@@ -94,6 +94,11 @@ if(ICU_FOUND)
         PROPERTIES COMPILE_DEFINITIONS NCNN_MOE_TOKENIZER_ICU=1)
     target_link_libraries(ncnn_moe PRIVATE ICU::i18n ICU::uc ICU::data)
 endif()
+if(MSVC)
+    # Tokenizer literals, templates, and parity fixtures must retain UTF-8 bytes.
+    set_property(SOURCE src/models/tokenizer.cpp tests/test_tokenizer.cpp APPEND PROPERTY COMPILE_OPTIONS /utf-8)
+endif()
+
 if(APPLE)
     target_link_libraries(ncnn_moe PRIVATE "-framework Accelerate")
 endif()
