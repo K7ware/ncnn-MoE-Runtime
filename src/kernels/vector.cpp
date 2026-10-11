@@ -156,8 +156,15 @@ static void neon_bfloat16_gemm(const uint16_t* weights,
                 for (uint32_t j = 0; j < 4; ++j)
                     x[j] = vld1q_f32(input + k + j * 4);
                 for (uint32_t r = 0; r < 4; ++r)
-                    for (uint32_t j = 0; j < 4; ++j)
-                        sums[r][j] = vfmaq_f32(sums[r][j], x[j], vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(w + r * weight_stride + k + j * 4), 16)));
+                {
+                    const uint16_t* wr = w + static_cast<size_t>(r) * weight_stride + k;
+                    const uint16x8_t w0 = vld1q_u16(wr);
+                    const uint16x8_t w1 = vld1q_u16(wr + 8);
+                    sums[r][0] = vfmaq_f32(sums[r][0], x[0], vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(w0), 16)));
+                    sums[r][1] = vfmaq_f32(sums[r][1], x[1], vreinterpretq_f32_u32(vshll_high_n_u16(w0, 16)));
+                    sums[r][2] = vfmaq_f32(sums[r][2], x[2], vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(w1), 16)));
+                    sums[r][3] = vfmaq_f32(sums[r][3], x[3], vreinterpretq_f32_u32(vshll_high_n_u16(w1, 16)));
+                }
             }
             for (uint32_t r = 0; r < 4; ++r)
             {
