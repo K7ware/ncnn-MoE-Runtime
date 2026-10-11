@@ -311,25 +311,32 @@ static void forward_expert(const CompiledModel& model,
         }
     }
     ActivationBuffer& up = workspace.projection;
-    expert_linear(up_weight,
-                  nullptr,
-                  operators.find_weight(expert.up_weight),
-                  input,
-                  up,
-                  optimization_flags,
-                  &workspace.quantized_input);
-    if (expert.layout != ExpertLayout::UpDown)
-    {
-        if (prefetch && !gate_prefetched)
-            prefetch_weight(weights, expert.gate_weight);
-        ActivationBuffer& gate = workspace.gate;
-        expert_linear(weights.at(expert.gate_weight),
+    if (prefetch && !gate_prefetched && expert.layout != ExpertLayout::UpDown)
+        prefetch_weight(weights, expert.gate_weight);
+    const bool paired = expert.layout != ExpertLayout::UpDown
+                        && forward_linear_pair(up_weight, weights.at(expert.gate_weight), input,
+                                               up, workspace.gate, optimization_flags,
+                                               operators.find_weight(expert.up_weight), operators.find_weight(expert.gate_weight),
+                                               &workspace.quantized_input);
+    if (!paired)
+        expert_linear(up_weight,
                       nullptr,
-                      operators.find_weight(expert.gate_weight),
+                      operators.find_weight(expert.up_weight),
                       input,
-                      gate,
+                      up,
                       optimization_flags,
                       &workspace.quantized_input);
+    if (expert.layout != ExpertLayout::UpDown)
+    {
+        ActivationBuffer& gate = workspace.gate;
+        if (!paired)
+            expert_linear(weights.at(expert.gate_weight),
+                          nullptr,
+                          operators.find_weight(expert.gate_weight),
+                          input,
+                          gate,
+                          optimization_flags,
+                          &workspace.quantized_input);
         const bool vector_silu = up.columns() >= 4
                                  && expert.activation_limit <= 0.0f
                                  && has_flag(optimization_flags, OptimizationCpuFastSilu)

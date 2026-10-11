@@ -10949,6 +10949,136 @@ void test_deepseek_router_and_hyper_connection_kernels()
     const std::string float8_kernel_name = float8_linear_kernel_name(g_test_optimization_flags);
     check(static_cast<bool>(!float8_kernel_name.empty()));
 
+    constexpr uint32_t pair_bfloat16_columns = 35;
+    auto make_bfloat16_pair_weight = [pair_bfloat16_columns](uint32_t output_columns, uint32_t seed) {
+        TensorData matrix;
+        matrix.dtype = DType::BFloat16;
+        matrix.shape = {output_columns, pair_bfloat16_columns};
+        matrix.bfloat16_data.resize(matrix.element_count());
+        for (size_t index = 0; index < matrix.bfloat16_data.size(); ++index)
+        {
+            const float value = static_cast<float>(static_cast<int>((index * 13 + seed * 7) % 37) - 18)
+                                * 0.0078125f;
+            matrix.bfloat16_data[index] = float_to_bfloat16(value);
+        }
+        return matrix;
+    };
+    const TensorData bfloat16_pair_first = make_bfloat16_pair_weight(9, 1);
+    const TensorData bfloat16_pair_second = make_bfloat16_pair_weight(5, 2);
+    ActivationBuffer bfloat16_pair_input(1, pair_bfloat16_columns);
+    for (uint32_t column = 0; column < pair_bfloat16_columns; ++column)
+    {
+        bfloat16_pair_input.row(0)[column] = static_cast<float>(static_cast<int>((column * 11) % 29) - 14)
+                                             * 0.015625f;
+    }
+    ActivationBuffer bfloat16_pair_first_output;
+    ActivationBuffer bfloat16_pair_second_output;
+    const bool bfloat16_pair_used = forward_linear_pair(bfloat16_pair_first,
+                                                        bfloat16_pair_second,
+                                                        bfloat16_pair_input,
+                                                        bfloat16_pair_first_output,
+                                                        bfloat16_pair_second_output,
+                                                        g_test_optimization_flags);
+#if defined(__aarch64__) || defined(_M_ARM64)
+    check(bfloat16_pair_used);
+    for (const auto& projection : {std::pair<const TensorData*, const ActivationBuffer*>{
+                                       &bfloat16_pair_first, &bfloat16_pair_first_output},
+                                   std::pair<const TensorData*, const ActivationBuffer*>{
+                                       &bfloat16_pair_second, &bfloat16_pair_second_output}})
+    {
+        for (uint32_t output_column = 0; output_column < projection.first->shape[0]; ++output_column)
+        {
+            float expected = 0.0f;
+            for (uint32_t input_column = 0; input_column < pair_bfloat16_columns; ++input_column)
+            {
+                expected += bfloat16_to_float(projection.first->bfloat16_data[static_cast<size_t>(output_column) * pair_bfloat16_columns + input_column])
+                            * bfloat16_pair_input.row(0)[input_column];
+            }
+            check_near(projection.second->row(0)[output_column], expected, 1e-6f);
+        }
+    }
+
+    TensorData mismatched_bfloat16_pair = bfloat16_pair_second;
+    mismatched_bfloat16_pair.shape[1] = pair_bfloat16_columns - 1;
+    ActivationBuffer untouched_pair_output(1, 2);
+    untouched_pair_output.row(0)[0] = 3.0f;
+    untouched_pair_output.row(0)[1] = -4.0f;
+    check(!forward_linear_pair(bfloat16_pair_first,
+                               mismatched_bfloat16_pair,
+                               bfloat16_pair_input,
+                               untouched_pair_output,
+                               bfloat16_pair_second_output,
+                               g_test_optimization_flags));
+    check(untouched_pair_output.columns() == 2);
+    check(untouched_pair_output.row(0)[0] == 3.0f);
+    check(untouched_pair_output.row(0)[1] == -4.0f);
+    check(!forward_linear_pair(bfloat16_pair_first,
+                               bfloat16_pair_second,
+                               bfloat16_pair_input,
+                               untouched_pair_output,
+                               untouched_pair_output,
+                               g_test_optimization_flags));
+    check(untouched_pair_output.columns() == 2);
+    check(untouched_pair_output.row(0)[0] == 3.0f);
+    check(!forward_linear_pair(bfloat16_pair_first,
+                               bfloat16_pair_second,
+                               bfloat16_pair_input,
+                               bfloat16_pair_input,
+                               bfloat16_pair_second_output,
+                               g_test_optimization_flags));
+    check(bfloat16_pair_input.row(0)[0] == -0.21875f);
+    TensorData missing_bfloat16_storage = bfloat16_pair_second;
+    missing_bfloat16_storage.bfloat16_data.clear();
+    check(!forward_linear_pair(bfloat16_pair_first,
+                               missing_bfloat16_storage,
+                               bfloat16_pair_input,
+                               untouched_pair_output,
+                               bfloat16_pair_second_output,
+                               g_test_optimization_flags));
+    check(untouched_pair_output.columns() == 2);
+    check(untouched_pair_output.row(0)[0] == 3.0f);
+    ActivationBuffer bfloat16_pair_non_float_output(1, 2, DType::BFloat16);
+    check(!forward_linear_pair(bfloat16_pair_first,
+                               bfloat16_pair_second,
+                               bfloat16_pair_input,
+                               bfloat16_pair_non_float_output,
+                               bfloat16_pair_second_output,
+                               g_test_optimization_flags));
+    ActivationBuffer bfloat16_pair_non_float_input(1, pair_bfloat16_columns, DType::BFloat16);
+    check(!forward_linear_pair(bfloat16_pair_first,
+                               bfloat16_pair_second,
+                               bfloat16_pair_non_float_input,
+                               untouched_pair_output,
+                               bfloat16_pair_second_output,
+                               g_test_optimization_flags));
+#if NCNN_MOE_WITH_NCNN
+    TensorData bfloat16_pair_linear_weight;
+    bfloat16_pair_linear_weight.dtype = DType::Float32;
+    bfloat16_pair_linear_weight.shape = {2, pair_bfloat16_columns};
+    bfloat16_pair_linear_weight.float32_data.resize(bfloat16_pair_linear_weight.element_count(), 0.125f);
+    const auto bfloat16_pair_linear = Linear::create(bfloat16_pair_linear_weight,
+                                                     nullptr,
+                                                     LinearDevice::Cpu,
+                                                     automatic_vulkan_device_index,
+                                                     {},
+                                                     g_test_optimization_flags);
+    check(static_cast<bool>(bfloat16_pair_linear));
+    CompiledOperator bfloat16_pair_operator;
+    bfloat16_pair_operator.linear = bfloat16_pair_linear;
+    check(!forward_linear_pair(bfloat16_pair_first,
+                               bfloat16_pair_second,
+                               bfloat16_pair_input,
+                               untouched_pair_output,
+                               bfloat16_pair_second_output,
+                               g_test_optimization_flags,
+                               &bfloat16_pair_operator));
+    check(untouched_pair_output.columns() == 2);
+    check(untouched_pair_output.row(0)[0] == 3.0f);
+#endif
+#else
+    check(!bfloat16_pair_used);
+#endif
+
     auto make_float8_projection = [](uint32_t seed,
                                      uint32_t output_columns) {
         TensorData matrix;
@@ -11003,12 +11133,12 @@ void test_deepseek_router_and_hyper_connection_kernels()
     }
     ActivationBuffer paired_gate;
     ActivationBuffer paired_up;
-    check(forward_linear_pair_float8(float8_gate,
-                                     float8_up,
-                                     fused_input,
-                                     paired_gate,
-                                     paired_up,
-                                     g_test_optimization_flags));
+    check(forward_linear_pair(float8_gate,
+                              float8_up,
+                              fused_input,
+                              paired_gate,
+                              paired_up,
+                              g_test_optimization_flags));
     for (size_t token_index = 0; token_index < fused_input.rows();
          ++token_index)
     {
@@ -11024,29 +11154,29 @@ void test_deepseek_router_and_hyper_connection_kernels()
     ActivationBuffer scratch_pair_gate;
     ActivationBuffer scratch_pair_up;
     ActivationBuffer quantized_input_scratch;
-    check(forward_linear_pair_float8(float8_gate,
-                                     float8_up,
-                                     fused_input,
-                                     scratch_pair_gate,
-                                     scratch_pair_up,
-                                     g_test_optimization_flags,
-                                     nullptr,
-                                     nullptr,
-                                     &quantized_input_scratch));
+    check(forward_linear_pair(float8_gate,
+                              float8_up,
+                              fused_input,
+                              scratch_pair_gate,
+                              scratch_pair_up,
+                              g_test_optimization_flags,
+                              nullptr,
+                              nullptr,
+                              &quantized_input_scratch));
     const size_t initial_quantized_capacity = quantized_input_scratch.allocated_bytes();
     const std::byte* initial_quantized_address = quantized_input_scratch.bytes().data();
     std::fill(quantized_input_scratch.mutable_bytes().begin(),
               quantized_input_scratch.mutable_bytes().end(),
               std::byte{0xa5});
-    check(forward_linear_pair_float8(float8_gate,
-                                     float8_up,
-                                     fused_input,
-                                     scratch_pair_gate,
-                                     scratch_pair_up,
-                                     g_test_optimization_flags,
-                                     nullptr,
-                                     nullptr,
-                                     &quantized_input_scratch));
+    check(forward_linear_pair(float8_gate,
+                              float8_up,
+                              fused_input,
+                              scratch_pair_gate,
+                              scratch_pair_up,
+                              g_test_optimization_flags,
+                              nullptr,
+                              nullptr,
+                              &quantized_input_scratch));
     check(quantized_input_scratch.allocated_bytes() == initial_quantized_capacity);
     check(quantized_input_scratch.bytes().data() == initial_quantized_address);
     for (size_t token_index = 0; token_index < fused_input.rows();
@@ -11070,21 +11200,21 @@ void test_deepseek_router_and_hyper_connection_kernels()
     }
     ActivationBuffer larger_default_gate;
     ActivationBuffer larger_default_up;
-    check(forward_linear_pair_float8(float8_gate,
-                                     float8_up,
-                                     larger_fused_input,
-                                     larger_default_gate,
-                                     larger_default_up,
-                                     g_test_optimization_flags));
-    check(forward_linear_pair_float8(float8_gate,
-                                     float8_up,
-                                     larger_fused_input,
-                                     scratch_pair_gate,
-                                     scratch_pair_up,
-                                     g_test_optimization_flags,
-                                     nullptr,
-                                     nullptr,
-                                     &quantized_input_scratch));
+    check(forward_linear_pair(float8_gate,
+                              float8_up,
+                              larger_fused_input,
+                              larger_default_gate,
+                              larger_default_up,
+                              g_test_optimization_flags));
+    check(forward_linear_pair(float8_gate,
+                              float8_up,
+                              larger_fused_input,
+                              scratch_pair_gate,
+                              scratch_pair_up,
+                              g_test_optimization_flags,
+                              nullptr,
+                              nullptr,
+                              &quantized_input_scratch));
     const size_t grown_quantized_capacity = quantized_input_scratch.allocated_bytes();
     const std::byte* grown_quantized_address = quantized_input_scratch.bytes().data();
     check(grown_quantized_capacity >= initial_quantized_capacity);
@@ -11102,15 +11232,15 @@ void test_deepseek_router_and_hyper_connection_kernels()
     std::fill(quantized_input_scratch.mutable_bytes().begin(),
               quantized_input_scratch.mutable_bytes().end(),
               std::byte{0x5a});
-    check(forward_linear_pair_float8(float8_gate,
-                                     float8_up,
-                                     fused_input,
-                                     scratch_pair_gate,
-                                     scratch_pair_up,
-                                     g_test_optimization_flags,
-                                     nullptr,
-                                     nullptr,
-                                     &quantized_input_scratch));
+    check(forward_linear_pair(float8_gate,
+                              float8_up,
+                              fused_input,
+                              scratch_pair_gate,
+                              scratch_pair_up,
+                              g_test_optimization_flags,
+                              nullptr,
+                              nullptr,
+                              &quantized_input_scratch));
     check(quantized_input_scratch.allocated_bytes() == grown_quantized_capacity);
     check(quantized_input_scratch.bytes().data() == grown_quantized_address);
     for (size_t token_index = 0; token_index < fused_input.rows();
@@ -11125,15 +11255,15 @@ void test_deepseek_router_and_hyper_connection_kernels()
         }
     }
     ActivationBuffer scratch_linear_output;
-    check(forward_linear_pair_float8(float8_gate,
-                                     float8_up,
-                                     fused_input,
-                                     scratch_pair_gate,
-                                     scratch_pair_up,
-                                     g_test_optimization_flags,
-                                     nullptr,
-                                     nullptr,
-                                     &quantized_input_scratch));
+    check(forward_linear_pair(float8_gate,
+                              float8_up,
+                              fused_input,
+                              scratch_pair_gate,
+                              scratch_pair_up,
+                              g_test_optimization_flags,
+                              nullptr,
+                              nullptr,
+                              &quantized_input_scratch));
     forward_linear(float8_gate,
                    fused_input,
                    scratch_linear_output,
@@ -11717,23 +11847,23 @@ void test_latent_attention_scratch_reuse()
     ActivationBuffer pair_probe_values;
     ActivationBuffer pair_probe_scores;
     ActivationBuffer pair_probe_scratch;
-    check(forward_linear_pair_float8(float8_compressor_value,
-                                     float8_compressor_gate,
-                                     compressed_input,
-                                     pair_probe_values,
-                                     pair_probe_scores,
-                                     g_test_optimization_flags,
-                                     nullptr,
-                                     nullptr,
-                                     &pair_probe_scratch));
+    check(forward_linear_pair(float8_compressor_value,
+                              float8_compressor_gate,
+                              compressed_input,
+                              pair_probe_values,
+                              pair_probe_scores,
+                              g_test_optimization_flags,
+                              nullptr,
+                              nullptr,
+                              &pair_probe_scratch));
     ActivationBuffer mixed_probe_values;
     ActivationBuffer mixed_probe_scores;
-    check(!forward_linear_pair_float8(float8_compressor_value,
-                                      mixed_compressor_gate,
-                                      compressed_input,
-                                      mixed_probe_values,
-                                      mixed_probe_scores,
-                                      g_test_optimization_flags));
+    check(!forward_linear_pair(float8_compressor_value,
+                               mixed_compressor_gate,
+                               compressed_input,
+                               mixed_probe_values,
+                               mixed_probe_scores,
+                               g_test_optimization_flags));
 
     auto check_activation_parity = [&](const ActivationBuffer& left, const ActivationBuffer& right) {
         check(left.rows() == right.rows());

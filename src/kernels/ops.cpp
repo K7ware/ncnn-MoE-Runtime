@@ -616,15 +616,15 @@ static uint32_t float8_linear_row_group_size_for_shape(const TensorData& matrix,
     return std::max(8u, kernel_group);
 }
 
-bool forward_linear_pair_float8(const TensorData& first,
-                                const TensorData& second,
-                                const ActivationBuffer& input,
-                                ActivationBuffer& first_output,
-                                ActivationBuffer& second_output,
-                                uint64_t optimization_flags,
-                                const CompiledOperator* first_executable,
-                                const CompiledOperator* second_executable,
-                                ActivationBuffer* quantized_input_scratch)
+bool forward_linear_pair(const TensorData& first,
+                         const TensorData& second,
+                         const ActivationBuffer& input,
+                         ActivationBuffer& first_output,
+                         ActivationBuffer& second_output,
+                         uint64_t optimization_flags,
+                         const CompiledOperator* first_op,
+                         const CompiledOperator* second_op,
+                         ActivationBuffer* quantized_input_scratch)
 {
     assert(!quantized_input_scratch
            || (quantized_input_scratch != &input
@@ -634,87 +634,145 @@ bool forward_linear_pair_float8(const TensorData& first,
         || quantized_input_scratch == &first_output
         || quantized_input_scratch == &second_output)
         quantized_input_scratch = nullptr;
-    if (!cpu_float8_fused_projections_enabled(optimization_flags)
-        || first.dtype != DType::Float8E4M3
-        || second.dtype != DType::Float8E4M3
-        || first.shape.size() != 2 || second.shape.size() != 2
-        || first.shape[1] != input.columns()
-        || second.shape[1] != input.columns()
-        || (first_executable && (first_executable->float8 || first_executable->linear))
-        || (second_executable && (second_executable->float8 || second_executable->linear))
+#if defined(__aarch64__) || defined(_M_ARM64)
+    const bool use_bfloat16 = first.dtype == DType::BFloat16
+                              && second.dtype == DType::BFloat16;
+#else
+    constexpr bool use_bfloat16 = false;
+#endif
+    const bool use_float8 = first.dtype == DType::Float8E4M3
+                            && second.dtype == DType::Float8E4M3;
+    if (!use_bfloat16
+        && (!use_float8 || !cpu_float8_fused_projections_enabled(optimization_flags)))
+        return false;
+
+    const uint32_t input_columns = input.columns();
+    if (input.dtype() != DType::Float32
+        || first_output.dtype() != DType::Float32
+        || second_output.dtype() != DType::Float32
+        || &input == &first_output
+        || &input == &second_output
+        || &first_output == &second_output
+        || first.shape.size() != 2
+        || second.shape.size() != 2
+        || first.shape[1] != input_columns
+        || second.shape[1] != input_columns
+        || (first_op && (first_op->linear || first_op->bfloat16 || first_op->float8 || first_op->qnk))
+        || (second_op && (second_op->linear || second_op->bfloat16 || second_op->float8 || second_op->qnk))
         || !dense_host_storage_available(first)
         || !dense_host_storage_available(second))
     {
         return false;
     }
-
-    // Keep the paired path free of decoded-weight side storage.
     constexpr uint32_t block_size = 128;
-    const uint32_t first_input_blocks = (first.shape[1] + block_size - 1) / block_size;
-    const uint32_t second_input_blocks = (second.shape[1] + block_size - 1) / block_size;
-    const uint32_t first_output_blocks = (first.shape[0] + block_size - 1) / block_size;
-    const uint32_t second_output_blocks = (second.shape[0] + block_size - 1) / block_size;
-    if (first.float8_values().size() != first.element_count()
-        || second.float8_values().size() != second.element_count()
-        || first.quantization_scales.size()
-               != static_cast<size_t>(first_output_blocks)
-                      * first_input_blocks
-        || second.quantization_scales.size()
-               != static_cast<size_t>(second_output_blocks)
-                      * second_input_blocks)
+    const uint32_t input_blocks = (input_columns + block_size - 1) / block_size;
+    uint32_t row_group_size = 0;
+    int team_size = 1;
+    if (use_bfloat16)
     {
-        return false;
+        if (input.rows() != 1
+            || first.shape[0] < 2 || second.shape[0] < 2
+            || input_columns < 16)
+        {
+            return false;
+        }
+
+        const size_t max_elements = input_columns <= 1024
+                                        ? 4u * 1024u * 1024u
+                                        : 512u * 1024u;
+        if (first.element_count() > max_elements
+            || second.element_count() > max_elements)
+        {
+            return false;
+        }
+
+        row_group_size = 8;
+        team_size = cpu_linear_team_size(std::max(first.element_count(), second.element_count()),
+                                         DType::BFloat16);
+    }
+    else
+    {
+        const uint32_t first_output_blocks = (first.shape[0] + block_size - 1) / block_size;
+        const uint32_t second_output_blocks = (second.shape[0] + block_size - 1) / block_size;
+        if (first.float8_values().size() != first.element_count()
+            || second.float8_values().size() != second.element_count()
+            || first.quantization_scales.size()
+                   != static_cast<size_t>(first_output_blocks) * input_blocks
+            || second.quantization_scales.size()
+                   != static_cast<size_t>(second_output_blocks) * input_blocks)
+        {
+            return false;
+        }
+
+        row_group_size = float8_linear_row_group_size(optimization_flags);
+        uint64_t operation_count = static_cast<uint64_t>(first.shape[0]) * input_columns
+                                   * input.rows();
+        const uint64_t second_operations = static_cast<uint64_t>(second.shape[0]) * input_columns
+                                           * input.rows();
+        if (operation_count > std::numeric_limits<uint64_t>::max()
+                                  - second_operations)
+        {
+            operation_count = std::numeric_limits<uint64_t>::max();
+        }
+        else
+        {
+            operation_count += second_operations;
+        }
+        team_size = cpu_linear_team_size(operation_count, DType::Float8E4M3);
     }
 
     first_output.reset(input.rows(), first.shape[0], false);
     second_output.reset(input.rows(), second.shape[0], false);
     ActivationBuffer local_quantized_input;
-    ActivationBuffer& quantized_input = quantized_input_scratch
-                                            ? *quantized_input_scratch
-                                            : local_quantized_input;
-    prepare_quantized_float8_input(quantized_input, input, optimization_flags);
+    ActivationBuffer* quantized_input = nullptr;
+    if (use_float8)
+    {
+        quantized_input = quantized_input_scratch
+                              ? quantized_input_scratch
+                              : &local_quantized_input;
+        prepare_quantized_float8_input(*quantized_input, input, optimization_flags);
+    }
 
-    const uint32_t row_group_size = float8_linear_row_group_size(optimization_flags);
-    const int64_t first_group_count = (static_cast<int64_t>(first.shape[0]) + row_group_size - 1)
-                                      / row_group_size;
-    const int64_t second_group_count = (static_cast<int64_t>(second.shape[0]) + row_group_size - 1)
-                                       / row_group_size;
-    uint64_t operation_count = static_cast<uint64_t>(first.shape[0]) * first.shape[1]
-                               * input.rows();
-    const uint64_t second_operations = static_cast<uint64_t>(second.shape[0]) * second.shape[1]
-                                       * input.rows();
-    if (operation_count > std::numeric_limits<uint64_t>::max()
-                              - second_operations)
+    const int64_t first_groups = (static_cast<int64_t>(first.shape[0]) + row_group_size - 1)
+                                 / row_group_size;
+    const int64_t second_groups = (static_cast<int64_t>(second.shape[0]) + row_group_size - 1)
+                                  / row_group_size;
+    const int64_t groups = first_groups + second_groups;
+    std::span<const uint16_t> first_bfloat16;
+    std::span<const uint16_t> second_bfloat16;
+    if (use_bfloat16)
     {
-        operation_count = std::numeric_limits<uint64_t>::max();
+        first_bfloat16 = first.bfloat16_values();
+        second_bfloat16 = second.bfloat16_values();
     }
-    else
+#pragma omp parallel for schedule(static) num_threads(team_size) if (team_size > 1)
+    for (int64_t group = 0; group < groups; ++group)
     {
-        operation_count += second_operations;
-    }
-    const int team_size = cpu_linear_team_size(operation_count, DType::Float8E4M3);
-    const bool parallelize = team_size > 1;
-#pragma omp parallel num_threads(team_size) if (parallelize)
-    {
-#pragma omp for schedule(static)
-        for (int64_t output_group = 0; output_group < first_group_count;
-             ++output_group)
+        const bool first_matrix = group < first_groups;
+        const TensorData& matrix = first_matrix ? first : second;
+        ActivationBuffer& output = first_matrix ? first_output : second_output;
+        const uint32_t group_index = static_cast<uint32_t>(first_matrix ? group : group - first_groups);
+        const uint32_t first_output_column = group_index * row_group_size;
+        const uint32_t group_size = std::min(row_group_size,
+                                             matrix.shape[0] - first_output_column);
+        if (use_bfloat16)
         {
-            const uint32_t first_output_column = static_cast<uint32_t>(output_group) * row_group_size;
-            const uint32_t group_size = std::min(row_group_size,
-                                                 first.shape[0] - first_output_column);
-            float8_linear_group_into(first, quantized_input, first_output, first_output_column,
-                                     group_size, first_input_blocks, block_size, optimization_flags);
+            const std::span<const uint16_t> weights = first_matrix ? first_bfloat16 : second_bfloat16;
+            bfloat16_gemm_4x8(weights.data()
+                                  + static_cast<size_t>(first_output_column) * input_columns,
+                              input_columns,
+                              input.row(0),
+                              input_columns,
+                              input_columns,
+                              group_size,
+                              1,
+                              output.row(0) + first_output_column,
+                              output.columns());
         }
-#pragma omp for schedule(static)
-        for (int64_t output_group = 0; output_group < second_group_count;
-             ++output_group)
+        else
         {
-            const uint32_t first_output_column = static_cast<uint32_t>(output_group) * row_group_size;
-            const uint32_t group_size = std::min(row_group_size,
-                                                 second.shape[0] - first_output_column);
-            float8_linear_group_into(second, quantized_input, second_output, first_output_column,
-                                     group_size, second_input_blocks, block_size, optimization_flags);
+            float8_linear_group_into(matrix, *quantized_input, output, first_output_column,
+                                     group_size, input_blocks, block_size, optimization_flags);
         }
     }
     return true;

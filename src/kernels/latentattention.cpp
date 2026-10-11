@@ -398,10 +398,10 @@ static void append_compressed_value(const WeightStore& weights,
                                                                                    compressor_values,
                                                                                    compressor_scores);
         if (!used_vulkan_pair
-            && !forward_linear_pair_float8(value_weight, gate_weight, input,
-                                           compressor_values, compressor_scores, optimization_flags,
-                                           operators.find_weight(value_handle), operators.find_weight(gate_handle),
-                                           &scratch.quantized_input))
+            && !forward_linear_pair(value_weight, gate_weight, input,
+                                    compressor_values, compressor_scores, optimization_flags,
+                                    operators.find_weight(value_handle), operators.find_weight(gate_handle),
+                                    &scratch.quantized_input))
         {
             forward_linear(value_weight, input, compressor_values, optimization_flags,
                            operators.find_weight(value_handle), backend, &scratch.quantized_input);
@@ -744,15 +744,15 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
         {
             const TensorData& value_weight = weights.at(value_handle);
             const TensorData& gate_weight = weights.at(gate_handle);
-            if (!forward_linear_pair_float8(value_weight,
-                                            gate_weight,
-                                            normalized,
-                                            value_output,
-                                            gate_output,
-                                            optimization_flags,
-                                            operators.find_weight(value_handle),
-                                            operators.find_weight(gate_handle),
-                                            &scratch.quantized_input))
+            if (!forward_linear_pair(value_weight,
+                                     gate_weight,
+                                     normalized,
+                                     value_output,
+                                     gate_output,
+                                     optimization_flags,
+                                     operators.find_weight(value_handle),
+                                     operators.find_weight(gate_handle),
+                                     &scratch.quantized_input))
             {
                 // Keep the BF16 fallback input in float32, matching the single-row path.
                 const uint64_t compressor_flags = optimization_flags
@@ -929,10 +929,10 @@ Result<void> forward_latent_attention_batch(const WeightStore& weights,
                              plan.norm_epsilon, normalized, 0.0f);
             normalized_ready = true;
         }
-        const bool paired_projection = forward_linear_pair_float8(query_a, key_value_weight, normalized, query_rank,
-                                                                  key_value, optimization_flags,
-                                                                  operators.find_weight(plan.query_a_weight), operators.find_weight(plan.key_value_weight),
-                                                                  &scratch.quantized_input);
+        const bool paired_projection = forward_linear_pair(query_a, key_value_weight, normalized, query_rank,
+                                                           key_value, optimization_flags,
+                                                           operators.find_weight(plan.query_a_weight), operators.find_weight(plan.key_value_weight),
+                                                           &scratch.quantized_input);
         if (!paired_projection)
         {
             forward_linear(query_a, normalized, query_rank, optimization_flags,
@@ -1517,10 +1517,10 @@ Result<void> forward_dspark_attention(const WeightStore& weights,
                              plan.norm_epsilon, normalized, 0.0f);
             normalized_ready = true;
         }
-        const bool paired_projection = forward_linear_pair_float8(query_a, key_value_weight, normalized, query_rank,
-                                                                  key_value, optimization_flags,
-                                                                  operators.find_weight(plan.query_a_weight), operators.find_weight(plan.key_value_weight),
-                                                                  &scratch.quantized_input);
+        const bool paired_projection = forward_linear_pair(query_a, key_value_weight, normalized, query_rank,
+                                                           key_value, optimization_flags,
+                                                           operators.find_weight(plan.query_a_weight), operators.find_weight(plan.key_value_weight),
+                                                           &scratch.quantized_input);
         if (!paired_projection)
         {
             forward_linear(query_a, normalized, query_rank, optimization_flags,

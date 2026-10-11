@@ -83,15 +83,15 @@ void forward_embedding(const TensorData& embedding, std::span<const int32_t> inp
 [[nodiscard]] ActivationBuffer forward_linear(const TensorData& matrix, const ActivationBuffer& input, uint64_t optimization_flags, const CompiledOperator* op = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu);
 // A quantized input scratch, when supplied, must not alias input or output.
 void forward_linear(const TensorData& matrix, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, const CompiledOperator* op = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu, ActivationBuffer* quantized_input_scratch = nullptr);
-[[nodiscard]] bool forward_linear_pair_float8(const TensorData& first,
-                                              const TensorData& second,
-                                              const ActivationBuffer& input,
-                                              ActivationBuffer& first_output,
-                                              ActivationBuffer& second_output,
-                                              uint64_t optimization_flags,
-                                              const CompiledOperator* first_executable = nullptr,
-                                              const CompiledOperator* second_executable = nullptr,
-                                              ActivationBuffer* quantized_input_scratch = nullptr);
+[[nodiscard]] bool forward_linear_pair(const TensorData& first,
+                                       const TensorData& second,
+                                       const ActivationBuffer& input,
+                                       ActivationBuffer& first_output,
+                                       ActivationBuffer& second_output,
+                                       uint64_t optimization_flags,
+                                       const CompiledOperator* first_op = nullptr,
+                                       const CompiledOperator* second_op = nullptr,
+                                       ActivationBuffer* quantized_input_scratch = nullptr);
 [[nodiscard]] bool forward_linear_rms_norm_float8(const TensorData& matrix,
                                                   const ActivationBuffer& input,
                                                   const TensorData& norm_weight,

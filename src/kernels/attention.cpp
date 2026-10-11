@@ -1577,7 +1577,13 @@ Result<void> append_attention_context(const WeightStore& weights,
             std::copy_n(source, key_value_columns, value.row(token_index));
         }
     }
-    else
+    else if (backend != ExecutionBackend::Cpu
+             || plan.key_bias != invalid_tensor_handle
+             || plan.value_bias != invalid_tensor_handle
+             || !forward_linear_pair(weights.at(plan.key_weight), weights.at(plan.value_weight), *normalized,
+                                     key, value, optimization_flags,
+                                     operators.find_weight(plan.key_weight), operators.find_weight(plan.value_weight),
+                                     &scratch.quantized_input))
     {
         attention_linear_into(weights, operators, plan.key_weight, plan.key_bias, *normalized, key, optimization_flags, backend);
         attention_linear_into(weights, operators, plan.value_weight, plan.value_bias, *normalized, value, optimization_flags, backend);
@@ -1743,11 +1749,11 @@ Result<void> forward_attention(const WeightStore& weights,
     ActivationBuffer& fused_qkv = scratch.fused_qkv;
     const CompiledOperator& fused_qkv_gate_operator = operators.at(plan.fused_qkv_gate_bfloat16_operator);
     const CompiledOperator& fused_qkv_operator = operators.at(plan.fused_qkv_operator);
-    const bool fused_output_gate = backend == ExecutionBackend::Vulkan
-                                   && fused_qkv_gate_operator.bfloat16
-                                   && fused_qkv_gate_operator.bfloat16->forward(*normalized,
-                                                                                fused_qkv);
-    const bool fused_projection = fused_output_gate
+    bool gate_ready = backend == ExecutionBackend::Vulkan
+                      && fused_qkv_gate_operator.bfloat16
+                      && fused_qkv_gate_operator.bfloat16->forward(*normalized,
+                                                                   fused_qkv);
+    const bool fused_projection = gate_ready
                                   || (backend == ExecutionBackend::Vulkan
                                       && fused_qkv_operator.bfloat16
                                       && fused_qkv_operator.bfloat16->forward(*normalized,
@@ -1763,7 +1769,7 @@ Result<void> forward_attention(const WeightStore& weights,
         query.reset(hidden.rows(), query_columns, false);
         key.reset(hidden.rows(), key_value_columns, false);
         value.reset(hidden.rows(), key_value_columns, false);
-        if (fused_output_gate)
+        if (gate_ready)
             scratch.gate.reset(hidden.rows(), query_columns, false);
         for (size_t token_index = 0; token_index < hidden.rows(); ++token_index)
         {
@@ -1774,7 +1780,7 @@ Result<void> forward_attention(const WeightStore& weights,
             source += key_value_columns;
             std::copy_n(source, key_value_columns, value.row(token_index));
             source += key_value_columns;
-            if (fused_output_gate)
+            if (gate_ready)
             {
                 std::copy_n(source,
                             query_columns,
@@ -1784,9 +1790,26 @@ Result<void> forward_attention(const WeightStore& weights,
     }
     else
     {
-        attention_linear_into(weights, operators, plan.query_weight, plan.query_bias, *normalized, query, optimization_flags, backend);
-        attention_linear_into(weights, operators, plan.key_weight, plan.key_bias, *normalized, key, optimization_flags, backend);
-        attention_linear_into(weights, operators, plan.value_weight, plan.value_bias, *normalized, value, optimization_flags, backend);
+        gate_ready = backend == ExecutionBackend::Cpu
+                     && has_flag(plan.flags, AttentionBlockOutputGate)
+                     && plan.query_bias == invalid_tensor_handle
+                     && forward_linear_pair(weights.at(plan.query_weight), weights.at(plan.output_gate_weight), *normalized,
+                                            query, scratch.gate, optimization_flags,
+                                            operators.find_weight(plan.query_weight), operators.find_weight(plan.output_gate_weight),
+                                            &scratch.quantized_input);
+        if (!gate_ready)
+            attention_linear_into(weights, operators, plan.query_weight, plan.query_bias, *normalized, query, optimization_flags, backend);
+        if (backend != ExecutionBackend::Cpu
+            || plan.key_bias != invalid_tensor_handle
+            || plan.value_bias != invalid_tensor_handle
+            || !forward_linear_pair(weights.at(plan.key_weight), weights.at(plan.value_weight), *normalized,
+                                    key, value, optimization_flags,
+                                    operators.find_weight(plan.key_weight), operators.find_weight(plan.value_weight),
+                                    &scratch.quantized_input))
+        {
+            attention_linear_into(weights, operators, plan.key_weight, plan.key_bias, *normalized, key, optimization_flags, backend);
+            attention_linear_into(weights, operators, plan.value_weight, plan.value_bias, *normalized, value, optimization_flags, backend);
+        }
     }
 
     if (has_flag(plan.flags, AttentionBlockQueryKeyNorm))
@@ -1858,7 +1881,7 @@ Result<void> forward_attention(const WeightStore& weights,
                                       optimization_flags);
     if (has_flag(plan.flags, AttentionBlockOutputGate))
     {
-        if (!fused_output_gate)
+        if (!gate_ready)
         {
             attention_linear_into(weights,
                                   operators,
