@@ -336,7 +336,7 @@ ExpertBackendStatistics MultiDeviceExpertBackend::statistics() const
 MultiDeviceExpertBackend::Submission::Submission(MultiDeviceExpertBackend* owner, std::span<const ExpertBackendRequest> requests, std::vector<std::vector<size_t>> request_indices)
     : client_requests(requests.begin(), requests.end()),
       private_outputs(requests.size()),
-      planned(requests.size(), ExpertBackendExecutionResult ::NotResident),
+      planned(requests.size(), ExpertBackendExecutionResult::NotResident),
       final(planned)
 {
     children.reserve(owner->backends.size());
@@ -368,7 +368,7 @@ MultiDeviceExpertBackend::Submission::Submission(MultiDeviceExpertBackend* owner
             {
                 child.submission->abort();
                 for (const size_t request_index : child.request_indices)
-                    planned[request_index] = ExpertBackendExecutionResult ::Failed;
+                    planned[request_index] = ExpertBackendExecutionResult::Failed;
             }
             else
             {
@@ -423,7 +423,7 @@ void MultiDeviceExpertBackend::Submission::wait(std::vector<ExpertBackendExecuti
             for (size_t index = 0; index < child_final.size(); ++index)
             {
                 const size_t request_index = child.request_indices[index];
-                if (child_final[index] == ExpertBackendExecutionResult ::Executed
+                if (child_final[index] == ExpertBackendExecutionResult::Executed
                     && planned[request_index] != ExpertBackendExecutionResult::Executed)
                 {
                     result_shape_valid = false;
@@ -435,7 +435,7 @@ void MultiDeviceExpertBackend::Submission::wait(std::vector<ExpertBackendExecuti
         {
             child.submission->abort();
             for (const size_t request_index : child.request_indices)
-                final[request_index] = ExpertBackendExecutionResult ::Failed;
+                final[request_index] = ExpertBackendExecutionResult::Failed;
             continue;
         }
         for (size_t index = 0; index < child_final.size(); ++index)

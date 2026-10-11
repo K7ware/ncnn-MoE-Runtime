@@ -399,10 +399,14 @@ static bool bfloat16_linear_gemm_tile_into(const TensorData& matrix,
                                            ActivationBuffer& output,
                                            int team_size)
 {
-    // Keep large decode streaming; allow small single-worker tiles.
-    const size_t max_elements = team_size == 1 && matrix.shape[1] <= 1024
-                                    ? 2u * 1024u * 1024u
-                                    : 512u * 1024u;
+    // Keep large decode streaming; reuse inputs across larger ARM64 output tiles.
+    size_t max_elements = team_size == 1 && matrix.shape[1] <= 1024
+                              ? 2u * 1024u * 1024u
+                              : 512u * 1024u;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (matrix.shape[1] <= 1024)
+        max_elements = 4u * 1024u * 1024u;
+#endif
     if (input.rows() == 0 || matrix.shape[0] < 2 || matrix.shape[1] < 16
         || (input.rows() == 1 && matrix.element_count() > max_elements))
         return false;

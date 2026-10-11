@@ -1690,7 +1690,7 @@ Result<void> forward_moe(const CompiledModel& model,
             {
                 for (size_t result_index = 0; result_index < planned.size(); ++result_index)
                 {
-                    if (planned[result_index] != ExpertBackendExecutionResult ::Executed)
+                    if (planned[result_index] != ExpertBackendExecutionResult::Executed)
                         continue;
                     backend_executed[backend_indices[result_index]] = 1;
                     backend_reserved_work = true;
@@ -1751,9 +1751,9 @@ Result<void> forward_moe(const CompiledModel& model,
                     continue;
                 const ExpertBackendExecutionResult backend_result = result_index < backend_results.size()
                                                                         ? backend_results[result_index]
-                                                                        : ExpertBackendExecutionResult ::Failed;
+                                                                        : ExpertBackendExecutionResult::Failed;
                 if (!backend_commit_succeeded
-                    || backend_result != ExpertBackendExecutionResult ::Executed)
+                    || backend_result != ExpertBackendExecutionResult::Executed)
                 {
                     backend_executed[active_index] = 0;
                     failed_indices.push_back(active_index);
@@ -2001,6 +2001,16 @@ Result<void> forward_moe(const CompiledModel& model,
     const auto forward_ready = [&](const std::vector<size_t>& indices,
                                    std::span<std::shared_ptr<const void>> preload_pins = {},
                                    size_t preload_prepared = 0) {
+        if (!gpu_priority && !use_backend_batch)
+        {
+            for (size_t active_index : indices)
+                layer_state.active_experts()[active_index].device_output.reset();
+            forward_experts(model, moe, layer_state, indices, scratch, prefetch);
+            for (size_t active_index : indices)
+                layer_state.active_experts()[active_index].lease = {};
+            return;
+        }
+
         std::vector<size_t>& cpu_indices = scratch.wave_cpu_indices;
         cpu_indices.clear();
         cpu_indices.reserve(indices.size());

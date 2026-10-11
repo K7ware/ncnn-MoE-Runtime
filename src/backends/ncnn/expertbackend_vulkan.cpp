@@ -201,10 +201,10 @@ std::optional<VulkanExpertVictimCache::DeviceOperationLease> VulkanExpertVictimC
         static_cast<size_t>(entry->down_blocks_offset),
         static_cast<size_t>(entry->down_scales_offset),
     };
-    auto operation = Mxfp4Expert_vulkan ::create_from_device_storage(gate_up, entry->execution.gate_up_bias, down, entry->execution.down_bias, entry->execution.activation_limit,
-                                                                     static_cast<uint32_t>(context->device()->info.device_index()), entry->data, entry->execution.activation,
-                                                                     context->runtime(),
-                                                                     context->optimization_flags());
+    auto operation = Mxfp4Expert_vulkan::create_from_device_storage(gate_up, entry->execution.gate_up_bias, down, entry->execution.down_bias, entry->execution.activation_limit,
+                                                                    static_cast<uint32_t>(context->device()->info.device_index()), entry->data, entry->execution.activation,
+                                                                    context->runtime(),
+                                                                    context->optimization_flags());
     if (!operation)
         return std::nullopt;
     {
@@ -1491,7 +1491,7 @@ std::unique_ptr<ExpertSubmission> VulkanExpertBackend::submit_batch(std::span<co
                 private_request.route_aggregation.completed = &work->private_route_completed[request_index];
             }
         }
-        work->planned.assign(requests.size(), ExpertBackendExecutionResult ::NotResident);
+        work->planned.assign(requests.size(), ExpertBackendExecutionResult::NotResident);
         work->selected.reserve(requests.size());
         {
             std::unique_lock<std::mutex> lock(mutex);
@@ -1503,7 +1503,7 @@ std::unique_ptr<ExpertSubmission> VulkanExpertBackend::submit_batch(std::span<co
                 if (!request.output || request.rows() == 0 || request.columns() == 0
                     || (!request.has_host_input() && !request.device_input))
                 {
-                    work->planned[request_index] = ExpertBackendExecutionResult ::Failed;
+                    work->planned[request_index] = ExpertBackendExecutionResult::Failed;
                     continue;
                 }
                 auto existing = entries.find(request.key);
@@ -1564,7 +1564,7 @@ std::unique_ptr<ExpertSubmission> VulkanExpertBackend::submit_batch(std::span<co
             // non-resident or failed requests.
             for (const Selection& selection : candidates)
             {
-                work->planned[selection.request_index] = ExpertBackendExecutionResult ::Executed;
+                work->planned[selection.request_index] = ExpertBackendExecutionResult::Executed;
             }
             // Prepare the public handle before borrowed inputs become visible
             // to the worker. A failed queue allocation completes the private item
@@ -2203,7 +2203,7 @@ void VulkanExpertBackend::execute_work_item(const std::shared_ptr<WorkItem>& wor
                 {
                     ++device_source_execution_failures;
                 }
-                final[selection.request_index] = ExpertBackendExecutionResult ::Failed;
+                final[selection.request_index] = ExpertBackendExecutionResult::Failed;
             }
         }
         else

@@ -3850,7 +3850,7 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         check(static_cast<bool>(backend_batch_results.size() == 2));
         for (ExpertBackendExecutionResult result : backend_batch_results)
         {
-            check(static_cast<bool>(result == ExpertBackendExecutionResult ::Executed));
+            check(static_cast<bool>(result == ExpertBackendExecutionResult::Executed));
         }
         for (uint32_t column = 0; column < backend_expected.columns(); ++column)
         {
