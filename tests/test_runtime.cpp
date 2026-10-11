@@ -17900,9 +17900,13 @@ void test_dense_expert_thread_budget()
     // matrix teams and serial execution, including reused uneven batches.
     for (DType dtype : {DType::Float32, DType::BFloat16})
     {
-        for (uint32_t hidden : {32u, 1024u})
+        for (uint32_t hidden : {32u, 1024u, 256u, 1025u})
         {
-            const uint32_t intermediate = hidden * 2;
+            if (dtype == DType::Float32 && hidden != 32 && hidden != 1024)
+                continue;
+            const bool grouped_bfloat16_case = dtype == DType::BFloat16
+                                               && (hidden == 256 || hidden == 1025);
+            const uint32_t intermediate = hidden == 1025 ? 2051u : hidden * 2;
             CompiledModel model;
             model.descriptor.hidden_size = hidden;
             model.opt.hybrid_mode = HybridMode::CpuOnly;
@@ -17924,10 +17928,15 @@ void test_dense_expert_thread_budget()
                 const std::string prefix = "expert." + std::to_string(expert_id) + ".";
                 expert.layout = ExpertLayout::PackedGateUpDown;
                 expert.activation = ExpertActivation::Silu;
+                if (grouped_bfloat16_case && hidden == 1025 && expert_id == 0)
+                    expert.activation_limit = 0.125f;
                 expert.gate_up_weight = add_weight(prefix + "gate_up", intermediate * 2, hidden, expert_id + 1);
                 expert.down_weight = add_weight(prefix + "down", hidden, intermediate, expert_id + 9);
-                expert.gate_up_bias = add_float_tensor(model.weights, prefix + "gate_up_bias", {intermediate * 2}, std::vector<float>(intermediate * 2, 0.01f));
-                expert.down_bias = add_float_tensor(model.weights, prefix + "down_bias", {hidden}, std::vector<float>(hidden, -0.02f));
+                if (!grouped_bfloat16_case)
+                {
+                    expert.gate_up_bias = add_float_tensor(model.weights, prefix + "gate_up_bias", {intermediate * 2}, std::vector<float>(intermediate * 2, 0.01f));
+                    expert.down_bias = add_float_tensor(model.weights, prefix + "down_bias", {hidden}, std::vector<float>(hidden, -0.02f));
+                }
             }
 
             LayerState state;
@@ -17941,6 +17950,9 @@ void test_dense_expert_thread_budget()
             bool poisoned_backend_scratch = false;
             for (uint32_t token_count : {1u, 3u, 8u, 1u})
             {
+                // Keep fast SiLU for the first decode, then test scalar activation on reused shapes.
+                if (grouped_bfloat16_case && hidden == 256 && token_count > 1)
+                    model.opt.optimization_flags = g_test_optimization_flags & ~OptimizationCpuFastSilu;
                 state.normalized.reset(token_count, hidden, false);
                 for (uint32_t row = 0; row < token_count; ++row)
                     for (uint32_t column = 0; column < hidden; ++column)
@@ -17966,8 +17978,10 @@ void test_dense_expert_thread_budget()
                     }
                 }
                 std::vector<ActivationBuffer> reference;
-                for (uint32_t threads : {1u, 2u, 4u})
+                for (uint32_t threads : {1u, 2u, 4u, 8u})
                 {
+                    if (threads == 8 && !grouped_bfloat16_case)
+                        continue;
                     thread_limit.set(threads);
                     state.reset();
                     scratch.decode_tasks.push_back({});
@@ -17997,7 +18011,9 @@ void test_dense_expert_thread_budget()
                         }
                         poisoned_backend_scratch = true;
                     }
-                    const bool prefetch = threads == 1 && token_count == 1;
+                    const bool prefetch = !grouped_bfloat16_case
+                                          && threads == 1
+                                          && token_count == 1;
                     check(static_cast<bool>(forward_moe(model, moe, state, statistics, scratch, 0, ExecutionBackend::Cpu, prefetch)));
                     check(state.experts_executed);
                     check(scratch.decode_tasks.empty());

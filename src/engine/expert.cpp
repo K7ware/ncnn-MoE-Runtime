@@ -797,6 +797,7 @@ static void forward_experts(const CompiledModel& model,
     bool parallelize_experts = false;
     int expert_team_size = 1;
 #if defined(_OPENMP)
+    bool parallelize_matrices = false;
     expert_team_size = std::min(static_cast<int>(active_indices.size()), static_cast<int>(cpu_linear_num_threads()));
     parallelize_experts = expert_team_size > 1;
     if (parallelize_experts
@@ -804,7 +805,7 @@ static void forward_experts(const CompiledModel& model,
     {
         // BF16 Experts may underfill the outer team. Prefer matrix teams
         // only when every projection can use at least twice as many threads.
-        bool parallelize_matrices = true;
+        parallelize_matrices = true;
         for (size_t active_index : active_indices)
         {
             const ExpertState& active = layer_state.active_experts()[active_index];
@@ -834,6 +835,174 @@ static void forward_experts(const CompiledModel& model,
                 break;
         }
         parallelize_experts = !parallelize_matrices;
+    }
+#endif
+#if defined(_OPENMP) && (defined(__aarch64__) || defined(_M_ARM64))
+    if (parallelize_matrices && active_indices.size() >= 2 && !prefetch
+        && layer_state.normalized.rows() == 1
+        && layer_state.normalized.dtype() == DType::Float32)
+    {
+        const size_t active_count = active_indices.size();
+        const uint32_t input_columns = layer_state.normalized.columns();
+        const auto executable = [](const CompiledOperator* op) {
+            return op && (op->linear || op->bfloat16 || op->float8 || op->qnk || op->attention || op->latent_attention || op->latent_layer || op->layer_head || op->gated_delta);
+        };
+        const TensorData* first_gate_up = nullptr;
+        const TensorData* first_down = nullptr;
+        bool grouped_bfloat16 = input_columns != 0;
+        for (size_t active_index : active_indices)
+        {
+            const ExpertState& active = layer_state.active_experts()[active_index];
+            const ExpertPlan& expert = moe.experts[active.batch.expert_id];
+            if (expert.layout != ExpertLayout::PackedGateUpDown
+                || expert.gate_up_weight == invalid_tensor_handle
+                || expert.down_weight == invalid_tensor_handle
+                || active.batch.routes.size() != 1 || active.input.rows() != 1
+                || active.input.columns() != input_columns
+                || active.input.dtype() != DType::Float32
+                || active.output.dtype() != DType::Float32
+                || active.input.bytes().data() == active.output.bytes().data())
+            {
+                grouped_bfloat16 = false;
+                break;
+            }
+
+            const TensorData& gate_up = active.lease.gate_up
+                                            ? *active.lease.gate_up
+                                            : model.weights.at(expert.gate_up_weight);
+            const TensorData& down = active.lease.down
+                                         ? *active.lease.down
+                                         : model.weights.at(expert.down_weight);
+            // The matrix-team check above already requires 2D BF16 weights.
+            const CompiledOperator* gate_op = active.lease.gate_up
+                                                  ? active.lease.gate_up_operator
+                                                  : model.operators.find_weight(expert.gate_up_weight);
+            const CompiledOperator* down_op = active.lease.down
+                                                  ? active.lease.down_operator
+                                                  : model.operators.find_weight(expert.down_weight);
+            if (expert.gate_up_bias != invalid_tensor_handle
+                || expert.down_bias != invalid_tensor_handle
+                || gate_up.shape[0] % 2 != 0 || gate_up.shape[1] != input_columns
+                || down.shape[0] != input_columns
+                || down.shape[1] != gate_up.shape[0] / 2
+                || gate_up.bfloat16_values().size() != gate_up.element_count()
+                || down.bfloat16_values().size() != down.element_count()
+                || executable(gate_op) || executable(down_op))
+            {
+                grouped_bfloat16 = false;
+                break;
+            }
+            if (!first_gate_up)
+            {
+                first_gate_up = &gate_up;
+                first_down = &down;
+            }
+            else if (gate_up.shape != first_gate_up->shape
+                     || down.shape != first_down->shape)
+            {
+                grouped_bfloat16 = false;
+                break;
+            }
+        }
+
+        if (grouped_bfloat16)
+        {
+            const uint32_t intermediate_size = first_gate_up->shape[0] / 2;
+            const uint32_t gate_rows = first_gate_up->shape[0];
+            const uint32_t gate_groups = gate_rows / 8 + (gate_rows % 8 != 0);
+            const uint32_t down_groups = input_columns / 8 + (input_columns % 8 != 0);
+            const int64_t gate_tasks = static_cast<int64_t>(active_count * gate_groups);
+            const int64_t down_tasks = static_cast<int64_t>(active_count * down_groups);
+            const size_t gate_limit = input_columns <= 1024
+                                          ? 4u * 1024u * 1024u
+                                          : 512u * 1024u;
+            const size_t down_limit = intermediate_size <= 1024
+                                          ? 4u * 1024u * 1024u
+                                          : 512u * 1024u;
+            const bool gate_gemm = gate_rows >= 2 && input_columns >= 16
+                                   && first_gate_up->element_count() <= gate_limit;
+            const bool down_gemm = input_columns >= 2 && intermediate_size >= 16
+                                   && first_down->element_count() <= down_limit;
+            if (scratch.expert_workspaces.size() < active_count)
+                scratch.expert_workspaces.resize(active_count);
+            for (size_t slot = 0; slot < active_count; ++slot)
+            {
+                ExpertState& active = layer_state.active_experts()[active_indices[slot]];
+                // Retain the gate/up stride across decode calls; down reads its first half.
+                scratch.expert_workspaces[slot].projection.reset(1, gate_rows, false);
+                active.output.reset(1, input_columns, false);
+            }
+
+            const auto forward = [&](size_t slot, uint32_t group, bool gate) {
+                ExpertState& active = layer_state.active_experts()[active_indices[slot]];
+                const ExpertPlan& expert = moe.experts[active.batch.expert_id];
+                const TensorData& matrix = gate
+                                               ? (active.lease.gate_up
+                                                      ? *active.lease.gate_up
+                                                      : model.weights.at(expert.gate_up_weight))
+                                               : (active.lease.down
+                                                      ? *active.lease.down
+                                                      : model.weights.at(expert.down_weight));
+                const uint32_t columns = gate ? input_columns : intermediate_size;
+                const uint32_t output_columns = gate ? gate_rows : input_columns;
+                const uint32_t first_row = group * 8;
+                const uint32_t rows = std::min(8u, output_columns - first_row);
+                const bool use_gemm = gate ? gate_gemm : down_gemm;
+                const float* input = gate
+                                         ? active.input.row(0)
+                                         : scratch.expert_workspaces[slot].projection.row(0);
+                float* output = gate
+                                    ? scratch.expert_workspaces[slot].projection.row(0)
+                                    : active.output.row(0);
+                const std::span<const uint16_t> weights = matrix.bfloat16_values();
+                const uint16_t* weight = weights.data() + static_cast<size_t>(first_row) * columns;
+                if (use_gemm)
+                    bfloat16_gemm_4x8(weight, columns, input, columns, columns,
+                                      rows, 1, output + first_row, output_columns);
+                else
+                    for (uint32_t row = 0; row < rows; ++row)
+                        output[first_row + row] = bfloat16_dot(weights.data() + static_cast<size_t>(first_row + row) * columns,
+                                                               input, columns);
+            };
+
+#pragma omp parallel num_threads(cpu_linear_num_threads())
+            {
+#pragma omp for schedule(static)
+                for (int64_t task = 0; task < gate_tasks; ++task)
+                    forward(static_cast<size_t>(task) / gate_groups,
+                            static_cast<uint32_t>(task % gate_groups), true);
+
+#pragma omp for schedule(static)
+                for (int64_t task = 0; task < static_cast<int64_t>(active_count); ++task)
+                {
+                    const size_t slot = static_cast<size_t>(task);
+                    ExpertState& active = layer_state.active_experts()[active_indices[slot]];
+                    const ExpertPlan& expert = moe.experts[active.batch.expert_id];
+                    float* values = scratch.expert_workspaces[slot].projection.row(0);
+                    const bool vector_silu = intermediate_size >= 4
+                                             && expert.activation_limit <= 0.0f
+                                             && has_flag(model.opt.optimization_flags,
+                                                         OptimizationCpuFastSilu)
+                                             && (expert.activation == ExpertActivation::Silu
+                                                 || expert.activation == ExpertActivation::DeepSeekSwiGlu);
+                    if (vector_silu)
+                        float_silu_mul(values, values, values + intermediate_size,
+                                       1.0f, 0.0f, intermediate_size);
+                    else
+                        for (uint32_t column = 0; column < intermediate_size; ++column)
+                            values[column] = activate(values[column], expert.activation,
+                                                      expert.activation_limit,
+                                                      model.opt.optimization_flags)
+                                             * values[intermediate_size + column];
+                }
+
+#pragma omp for schedule(static)
+                for (int64_t task = 0; task < down_tasks; ++task)
+                    forward(static_cast<size_t>(task) / down_groups,
+                            static_cast<uint32_t>(task % down_groups), false);
+            }
+            return;
+        }
     }
 #endif
     const int64_t parallel_expert_count = static_cast<int64_t>(active_indices.size());
