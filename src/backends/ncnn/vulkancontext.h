@@ -371,11 +371,6 @@ public:
         return vulkan_runtime;
     }
 
-    [[nodiscard]] uint32_t command_optimization_flags() const noexcept
-    {
-        return command_flags;
-    }
-
     [[nodiscard]] VulkanRuntimeState& runtime_state() noexcept
     {
         return vulkan_runtime->state;
@@ -405,8 +400,7 @@ public:
 private:
     explicit VulkanContext(ncnn::VulkanDevice* device,
                            VulkanRuntimePtr _vulkan_runtime,
-                           uint64_t optimization_flags,
-                           uint32_t command_optimization_flags);
+                           uint64_t optimization_flags);
 
     // Release dependent commands and tensors before returning borrowed allocators.
     void release_resources() noexcept;
@@ -414,7 +408,6 @@ private:
     ncnn::VulkanDevice* vkdev = nullptr;
     VulkanRuntimePtr vulkan_runtime;
     uint64_t flags = OptimizationDefaultFlags;
-    uint32_t command_flags = 0;
     ncnn::VkAllocator* blob_alloc = nullptr;
     ncnn::VkAllocator* staging_alloc = nullptr;
     std::mutex command_lock;

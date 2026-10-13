@@ -3,9 +3,7 @@
 
 #include "activationbuffer.h"
 
-#include "graph/layerplan.h"
 #include "ncnn/moe/result.h"
-#include "storage/weightstore.h"
 
 #include <cstdint>
 #include <span>
@@ -13,16 +11,18 @@
 namespace ncnn {
 namespace moe {
 
+class CompiledOperatorTable;
+class WeightStore;
+struct PleBlockPlan;
 struct LayerCache;
 struct AttentionScratch;
+struct MoeModelDescriptor;
 
 // Hidden must not alias the attention scratch buffers.
 [[nodiscard]] Result<void> forward_ple(const WeightStore& weights,
+                                       const CompiledOperatorTable& operators,
                                        const PleBlockPlan& plan,
-                                       uint32_t multiplier,
-                                       uint32_t hidden_size,
-                                       float norm_epsilon,
-                                       float norm_weight_offset,
+                                       const MoeModelDescriptor& descriptor,
                                        std::span<const int32_t> input_ids,
                                        LayerCache& cache,
                                        AttentionScratch& scratch,

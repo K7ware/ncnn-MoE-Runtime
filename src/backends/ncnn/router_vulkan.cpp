@@ -70,9 +70,9 @@ Router_vulkan::create(const TensorData& weight, const TensorData* bias,
         if (vector && (vector->shape.size() != 1 || vector->shape[0] != weight.shape[0] || (vector->dtype != DType::Float32 && vector->dtype != DType::BFloat16) || (vector->dtype == DType::Float32 && vector->float32_values().size() != weight.shape[0]) || (vector->dtype == DType::BFloat16 && vector->bfloat16_values().size() != weight.shape[0])))
             return {};
     }
-    const auto projection = Linear::create(weight, bias, LinearDevice::Vulkan, device_index, runtime,
+    const auto projection = Linear::create(weight, bias, device_index, runtime,
                                            optimization_flags);
-    if (!projection || !projection->uses_vulkan())
+    if (!projection)
         return {};
     std::shared_ptr<Router_vulkan> result(new Router_vulkan);
     Implementation& implementation = *result->d;

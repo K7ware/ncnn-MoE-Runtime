@@ -1,7 +1,11 @@
 #include "gatedresidual.h"
 
 #include "fastmath.h"
+#include "graph/compiledoperator.h"
+#include "graph/layerplan.h"
+#include "ncnn/moe/modeldescriptor.h"
 #include "ops.h"
+#include "storage/weightstore.h"
 
 #include <algorithm>
 #include <cmath>
@@ -32,20 +36,20 @@ static bool valid_bfloat16_vector(const TensorData& tensor, uint32_t size) noexc
            && tensor.bfloat16_values().size() == tensor.element_count();
 }
 
-static Result<void> gated_residual_pre_impl(const ActivationBuffer& input,
-                                            const TensorData& norm_weight,
-                                            const TensorData& mix_down_weight,
-                                            const TensorData& mix_up_weight,
-                                            const TensorData* inject_weight,
-                                            uint32_t multiplier,
-                                            uint32_t hidden_size,
-                                            float norm_epsilon,
-                                            float norm_weight_offset,
-                                            ActivationBuffer& reduced_output,
-                                            std::vector<float>* post_output,
-                                            HyperConnectionScratch& scratch,
-                                            uint64_t optimization_flags)
+static Result<void> forward_gated_residual(const ActivationBuffer& input,
+                                           const WeightStore& weights,
+                                           const CompiledOperatorTable& operators,
+                                           const GatedResidualPlan& plan,
+                                           const MoeModelDescriptor& descriptor,
+                                           ActivationBuffer& reduced_output,
+                                           std::vector<float>* post_output,
+                                           HyperConnectionScratch& scratch,
+                                           uint64_t optimization_flags)
 {
+    const uint32_t multiplier = descriptor.hyper_connection_multiplier;
+    const uint32_t hidden_size = descriptor.hidden_size;
+    const float norm_epsilon = descriptor.norm_epsilon;
+    const float norm_weight_offset = descriptor.norm_weight_offset;
     if (multiplier == 0 || hidden_size == 0
         || input.columns() != static_cast<size_t>(multiplier) * hidden_size
         || norm_epsilon <= 0.0f)
@@ -53,8 +57,14 @@ static Result<void> gated_residual_pre_impl(const ActivationBuffer& input,
         return Error{ErrorCode::InvalidArgument, "invalid gated-residual input dimensions"};
     }
     const uint32_t expanded_size = multiplier * hidden_size;
+    if (plan.norm_weight >= weights.size())
+        return Error{ErrorCode::InvalidModel, "invalid gated-residual normalization tensor"};
+    const TensorData& norm_weight = weights.at(plan.norm_weight);
     if (!valid_bfloat16_vector(norm_weight, expanded_size))
         return Error{ErrorCode::InvalidModel, "invalid gated-residual normalization tensor"};
+    if (plan.mix_down_weight >= weights.size())
+        return Error{ErrorCode::InvalidModel, "invalid gated-residual down projection"};
+    const TensorData& mix_down_weight = weights.at(plan.mix_down_weight);
     if (mix_down_weight.dtype != DType::BFloat16
         || mix_down_weight.shape.size() != 2
         || mix_down_weight.shape[1] != expanded_size
@@ -64,10 +74,20 @@ static Result<void> gated_residual_pre_impl(const ActivationBuffer& input,
         return Error{ErrorCode::InvalidModel, "invalid gated-residual down projection"};
     }
     const uint32_t low_rank = mix_down_weight.shape[0];
+    if (plan.mix_up_weight >= weights.size())
+        return Error{ErrorCode::InvalidModel, "invalid gated-residual up projection"};
+    const TensorData& mix_up_weight = weights.at(plan.mix_up_weight);
     if (!valid_bfloat16_matrix(mix_up_weight, expanded_size, low_rank))
         return Error{ErrorCode::InvalidModel, "invalid gated-residual up projection"};
-    if (inject_weight && !valid_bfloat16_matrix(*inject_weight, multiplier, expanded_size))
-        return Error{ErrorCode::InvalidModel, "invalid gated-residual block injection projection"};
+    const TensorData* inject_weight = nullptr;
+    if (post_output)
+    {
+        if (plan.inject_weight >= weights.size())
+            return Error{ErrorCode::InvalidModel, "invalid gated-residual block injection projection"};
+        inject_weight = &weights.at(plan.inject_weight);
+        if (!valid_bfloat16_matrix(*inject_weight, multiplier, expanded_size))
+            return Error{ErrorCode::InvalidModel, "invalid gated-residual block injection projection"};
+    }
 
     ActivationBuffer& normalized = scratch.normalized;
     normalized.reset(input.rows(), expanded_size, false);
@@ -91,7 +111,11 @@ static Result<void> gated_residual_pre_impl(const ActivationBuffer& input,
         }
     }
 
-    forward_linear(mix_down_weight, normalized, scratch.projection, optimization_flags);
+    forward_linear(mix_down_weight,
+                   normalized,
+                   scratch.projection,
+                   optimization_flags,
+                   operators.find_weight(plan.mix_down_weight));
     const float inverse_multiplier = 1.0f / static_cast<float>(multiplier);
     for (size_t row_index = 0; row_index < scratch.projection.rows(); ++row_index)
     {
@@ -102,14 +126,20 @@ static Result<void> gated_residual_pre_impl(const ActivationBuffer& input,
             row[column] = row[column] * gated_sigmoid(row[column]);
         }
     }
-    forward_linear(mix_up_weight, scratch.projection, scratch.auxiliary, optimization_flags);
+    forward_linear(mix_up_weight,
+                   scratch.projection,
+                   scratch.auxiliary,
+                   optimization_flags,
+                   operators.find_weight(plan.mix_up_weight));
 
     reduced_output.reset(input.rows(), hidden_size, true);
     if (inject_weight)
     {
-        if (!post_output)
-            return Error{ErrorCode::InternalError, "gated-residual post output is unavailable"};
-        forward_linear(*inject_weight, normalized, scratch.projection, optimization_flags);
+        forward_linear(*inject_weight,
+                       normalized,
+                       scratch.projection,
+                       optimization_flags,
+                       operators.find_weight(plan.inject_weight));
         post_output->resize(input.rows() * multiplier);
         for (size_t row_index = 0; row_index < input.rows(); ++row_index)
         {
@@ -119,11 +149,6 @@ static Result<void> gated_residual_pre_impl(const ActivationBuffer& input,
                 output[copy] = 2.0f * gated_sigmoid(row[copy] * inverse_multiplier);
         }
     }
-    else if (post_output)
-    {
-        post_output->resize(0);
-    }
-
     for (size_t row_index = 0; row_index < input.rows(); ++row_index)
     {
         const float* normalized_row = normalized.row(row_index);
@@ -144,32 +169,24 @@ static Result<void> gated_residual_pre_impl(const ActivationBuffer& input,
 }
 
 Result<void> forward_gated_residual_pre(const ActivationBuffer& input,
-                                        const TensorData& norm_weight,
-                                        const TensorData& mix_down_weight,
-                                        const TensorData& mix_up_weight,
-                                        const TensorData& inject_weight,
-                                        uint32_t multiplier,
-                                        uint32_t hidden_size,
-                                        float norm_epsilon,
-                                        float norm_weight_offset,
+                                        const WeightStore& weights,
+                                        const CompiledOperatorTable& operators,
+                                        const GatedResidualPlan& plan,
+                                        const MoeModelDescriptor& descriptor,
                                         HyperConnectionMix& result,
                                         HyperConnectionScratch& scratch,
                                         uint64_t optimization_flags)
 {
     result.combine.resize(0);
-    return gated_residual_pre_impl(input,
-                                   norm_weight,
-                                   mix_down_weight,
-                                   mix_up_weight,
-                                   &inject_weight,
-                                   multiplier,
-                                   hidden_size,
-                                   norm_epsilon,
-                                   norm_weight_offset,
-                                   result.reduced,
-                                   &result.post,
-                                   scratch,
-                                   optimization_flags);
+    return forward_gated_residual(input,
+                                  weights,
+                                  operators,
+                                  plan,
+                                  descriptor,
+                                  result.reduced,
+                                  &result.post,
+                                  scratch,
+                                  optimization_flags);
 }
 
 Result<void> forward_gated_residual_post(const ActivationBuffer& branch,
@@ -204,35 +221,25 @@ Result<void> forward_gated_residual_post(const ActivationBuffer& branch,
 }
 
 Result<void> forward_gated_residual_head(const ActivationBuffer& input,
-                                         const TensorData& norm_weight,
-                                         const TensorData& mix_down_weight,
-                                         const TensorData& mix_up_weight,
-                                         uint32_t multiplier,
-                                         uint32_t hidden_size,
-                                         float norm_epsilon,
-                                         float norm_weight_offset,
+                                         const WeightStore& weights,
+                                         const CompiledOperatorTable& operators,
+                                         const GatedResidualPlan& plan,
+                                         const MoeModelDescriptor& descriptor,
                                          ActivationBuffer& output,
                                          HyperConnectionScratch& scratch,
                                          uint64_t optimization_flags)
 {
     if (&output == &input)
         return Error{ErrorCode::InvalidArgument, "gated-residual head output must not alias input"};
-    auto mixed = gated_residual_pre_impl(input,
-                                         norm_weight,
-                                         mix_down_weight,
-                                         mix_up_weight,
-                                         nullptr,
-                                         multiplier,
-                                         hidden_size,
-                                         norm_epsilon,
-                                         norm_weight_offset,
-                                         output,
-                                         nullptr,
-                                         scratch,
-                                         optimization_flags);
-    if (!mixed)
-        return mixed.error();
-    return {};
+    return forward_gated_residual(input,
+                                  weights,
+                                  operators,
+                                  plan,
+                                  descriptor,
+                                  output,
+                                  nullptr,
+                                  scratch,
+                                  optimization_flags);
 }
 
 } // namespace moe

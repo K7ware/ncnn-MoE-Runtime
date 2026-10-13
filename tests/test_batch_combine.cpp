@@ -1,5 +1,7 @@
 #include "engine/executor.h"
 
+#include "modeladapter_fixture.h"
+
 #include "engine/expert.h"
 #include "engine/expertbackend.h"
 #include "engine/sessionstate.h"
@@ -424,13 +426,14 @@ static void run_batch_case(const CompiledModel& cpu_model,
     BatchWorkspace workspace;
     std::array<SessionState, input_ids.size()> sessions;
     std::array<SessionStatistics, input_ids.size()> statistics;
+    std::vector<std::vector<float>> actual(input_ids.size());
     std::array<DecodeBatchEntry, input_ids.size()> entries = {{
-        {input_ids[0], &statistics[0], &sessions[0], 0},
-        {input_ids[1], &statistics[1], &sessions[1], 0},
+        {input_ids[0], &statistics[0], &sessions[0], 0, &actual[0]},
+        {input_ids[1], &statistics[1], &sessions[1], 0, &actual[1]},
     }};
-    auto actual = forward_decode_batch(backend_model, entries, workspace);
-    require(static_cast<bool>(actual), "staged batch execution failed");
-    compare_logits(actual.value(), expected);
+    auto executed = forward_decode_batch(backend_model, entries, workspace);
+    require(static_cast<bool>(executed), "staged batch execution failed");
+    compare_logits(actual, expected);
     require(statistics[0].expert_batches != 0 && statistics[1].expert_batches != 0,
             "staged batch did not record expert execution statistics");
 

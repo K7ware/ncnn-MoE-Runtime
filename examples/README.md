@@ -57,10 +57,10 @@ reduce routed-Expert storage and improve GPU residency; without it, the
 official file-backed BF16 Experts remain supported. Use `--cpu` for a CPU-only
 comparison.
 
-CPU Expert weight repacking is an explicit experiment. Pass
-`--cpu-packed-weights on` to enable it for supported MXFP4-Q8 or Qn_K weights;
-when the option is absent, the worker keeps repack off and does not reserve an
-in-memory packed sidecar.
+CPU weight repacking is opt-in. Pass
+`--cpu-packed-weights on` to enable it for supported MXFP4-Q8 or Qn_K weights.
+When the option is absent, the worker keeps repacking off and does not reserve
+an in-memory packed layout.
 
 The CLI is the interactive text entry point; C++ consumers can use
 `Model::encode`, `Model::decode`, and `Model::stop_tokens`. The four

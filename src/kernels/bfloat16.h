@@ -8,39 +8,36 @@
 namespace ncnn {
 namespace moe {
 
-class Bfloat16BatchedLinearExecutionCounter
+class Bf16Counter
 {
 public:
-    [[nodiscard]] uint64_t dispatch_count() const noexcept;
+    [[nodiscard]] uint64_t dispatches() const noexcept;
 
 private:
-    friend class ScopedBfloat16BatchedLinearExecutionCounter;
-    friend void record_bfloat16_batched_linear_dispatch() noexcept;
+    friend void record_bf16_dispatch() noexcept;
     std::atomic<uint64_t> count{0};
 };
 
-class ScopedBfloat16BatchedLinearExecutionCounter
+class Bf16Scope
 {
 public:
-    explicit ScopedBfloat16BatchedLinearExecutionCounter(Bfloat16BatchedLinearExecutionCounter* counter) noexcept;
-    ~ScopedBfloat16BatchedLinearExecutionCounter();
+    explicit Bf16Scope(Bf16Counter* counter) noexcept;
+    ~Bf16Scope();
 
-    ScopedBfloat16BatchedLinearExecutionCounter(const ScopedBfloat16BatchedLinearExecutionCounter&) = delete;
-    ScopedBfloat16BatchedLinearExecutionCounter& operator=(const ScopedBfloat16BatchedLinearExecutionCounter&) = delete;
+    Bf16Scope(const Bf16Scope&) = delete;
+    Bf16Scope& operator=(const Bf16Scope&) = delete;
 
 private:
-    Bfloat16BatchedLinearExecutionCounter* previous = nullptr;
+    Bf16Counter* previous = nullptr;
 };
 
-[[nodiscard]] Bfloat16BatchedLinearExecutionCounter*
-current_bfloat16_batched_linear_execution_counter() noexcept;
+[[nodiscard]] Bf16Counter* current_bf16_counter() noexcept;
 
 // Runtime-dispatched BF16-by-FP32 dot product with scalar fallback.
 [[nodiscard]] float bfloat16_dot(const uint16_t* weights, const float* input, uint32_t count) noexcept;
 [[nodiscard]] const char* bfloat16_dot_kernel_name() noexcept;
 
-// Runtime-dispatched round-to-nearest-even conversion used by the KV cache
-// and optional BF16 attention packing paths.
+// Runtime-dispatched round-to-nearest-even conversion used by the KV cache.
 void float_to_bfloat16_array(uint16_t* output,
                              const float* input,
                              uint32_t count) noexcept;

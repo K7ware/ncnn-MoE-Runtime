@@ -326,13 +326,13 @@ static void layer_test_two_layers(uint32_t rows, LayerEndpoint endpoint, uint32_
     const TensorData head_norm = layer_constant({layer_hidden}, 1.0f);
     const TensorData lm_weight = layer_matrix(128, layer_hidden, seed + 37, 0.001f);
     CompiledOperator lm;
-    lm.linear = Linear::create(lm_weight, nullptr, LinearDevice::Vulkan, get_default_gpu_index(), runtime, layer_flags);
+    lm.linear = Linear::create(lm_weight, nullptr, get_default_gpu_index(), runtime, layer_flags);
     layer_check(static_cast<bool>(lm.linear), "create resident LM projection");
     auto head = LayerHead_vulkan::create(head_function, head_scale, head_base, head_norm, lm, layer_copies, layer_norm_epsilon, layer_hyper_epsilon, get_default_gpu_index(), runtime, layer_flags);
     layer_check(static_cast<bool>(head), "create fused final head");
     const VulkanRuntimePtr foreign_runtime = create_vulkan_runtime();
     CompiledOperator foreign_lm;
-    foreign_lm.linear = Linear::create(lm_weight, nullptr, LinearDevice::Vulkan, get_default_gpu_index(), foreign_runtime, layer_flags);
+    foreign_lm.linear = Linear::create(lm_weight, nullptr, get_default_gpu_index(), foreign_runtime, layer_flags);
     auto foreign_head = LayerHead_vulkan::create(head_function, head_scale, head_base, head_norm, foreign_lm, layer_copies, layer_norm_epsilon, layer_hyper_epsilon, get_default_gpu_index(), foreign_runtime, layer_flags);
     layer_check(static_cast<bool>(foreign_head), "create foreign runtime head");
     const ActivationBuffer input = layer_input(rows, seed);
@@ -552,7 +552,7 @@ static void layer_test_workspace_reuse()
     const TensorData head_norm = layer_constant({layer_hidden}, 1.0f);
     const TensorData lm_weight = layer_matrix(128, layer_hidden, seed + 37, 0.001f);
     CompiledOperator lm;
-    lm.linear = Linear::create(lm_weight, nullptr, LinearDevice::Vulkan, get_default_gpu_index(), runtime, layer_flags);
+    lm.linear = Linear::create(lm_weight, nullptr, get_default_gpu_index(), runtime, layer_flags);
     layer_check(static_cast<bool>(lm.linear), "reuse fixture LM projection");
     const auto head = LayerHead_vulkan::create(head_function, head_scale, head_base, head_norm, lm, layer_copies,
                                                layer_norm_epsilon, layer_hyper_epsilon, get_default_gpu_index(), runtime, layer_flags);

@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstring>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -24,11 +25,9 @@ __attribute__((target("avx512f,avx512bw"))) static void avx512_bfloat16_single_t
                                                                                             const float* input,
                                                                                             uint32_t output_columns,
                                                                                             uint32_t input_columns,
-                                                                                            float* output,
-                                                                                            int thread_count)
+                                                                                            float* output)
 {
     const int64_t output_groups = output_columns / 4;
-#pragma omp parallel for num_threads(thread_count) if (thread_count > 1)
     for (int64_t output_group = 0; output_group < output_groups;
          ++output_group)
     {
@@ -197,6 +196,58 @@ static float neon_bfloat16_dot(const uint16_t* weights, const float* input, uint
     float32x4_t sum2 = vdupq_n_f32(0.0f);
     float32x4_t sum3 = vdupq_n_f32(0.0f);
     uint32_t index = 0;
+    if (count >= 128)
+    {
+        float32x4_t sum4 = vdupq_n_f32(0.0f);
+        float32x4_t sum5 = vdupq_n_f32(0.0f);
+        float32x4_t sum6 = vdupq_n_f32(0.0f);
+        float32x4_t sum7 = vdupq_n_f32(0.0f);
+#if defined(__clang__)
+#pragma clang loop unroll_count(2)
+#elif defined(__GNUC__) && __GNUC__ >= 8
+#pragma GCC unroll 2
+#endif
+        for (; count - index >= 32; index += 32)
+        {
+            const uint16x8_t weights0 = vld1q_u16(weights + index);
+            const uint16x8_t weights1 = vld1q_u16(weights + index + 8);
+            const uint16x8_t weights2 = vld1q_u16(weights + index + 16);
+            const uint16x8_t weights3 = vld1q_u16(weights + index + 24);
+            sum0 = vfmaq_f32(sum0,
+                             vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(weights0), 16)),
+                             vld1q_f32(input + index));
+            sum1 = vfmaq_f32(sum1,
+                             vreinterpretq_f32_u32(vshll_high_n_u16(weights0, 16)),
+                             vld1q_f32(input + index + 4));
+            sum2 = vfmaq_f32(sum2,
+                             vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(weights1), 16)),
+                             vld1q_f32(input + index + 8));
+            sum3 = vfmaq_f32(sum3,
+                             vreinterpretq_f32_u32(vshll_high_n_u16(weights1, 16)),
+                             vld1q_f32(input + index + 12));
+            sum4 = vfmaq_f32(sum4,
+                             vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(weights2), 16)),
+                             vld1q_f32(input + index + 16));
+            sum5 = vfmaq_f32(sum5,
+                             vreinterpretq_f32_u32(vshll_high_n_u16(weights2, 16)),
+                             vld1q_f32(input + index + 20));
+            sum6 = vfmaq_f32(sum6,
+                             vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(weights3), 16)),
+                             vld1q_f32(input + index + 24));
+            sum7 = vfmaq_f32(sum7,
+                             vreinterpretq_f32_u32(vshll_high_n_u16(weights3, 16)),
+                             vld1q_f32(input + index + 28));
+        }
+        sum0 = vaddq_f32(sum0, sum4);
+        sum1 = vaddq_f32(sum1, sum5);
+        sum2 = vaddq_f32(sum2, sum6);
+        sum3 = vaddq_f32(sum3, sum7);
+    }
+#if defined(__clang__)
+#pragma clang loop unroll_count(4)
+#elif defined(__GNUC__) && __GNUC__ >= 8
+#pragma GCC unroll 4
+#endif
     for (; count - index >= 16; index += 16)
     {
         const uint16x8_t weights0 = vld1q_u16(weights + index);
@@ -227,12 +278,14 @@ static float neon_bfloat16_dot(const uint16_t* weights, const float* input, uint
                          vld1q_f32(input + index));
     }
     float sum = vaddvq_f32(sum0);
-    for (; index < count; ++index)
+    const uint32_t tail_count = count & 3u;
+    for (uint32_t tail = 0; tail < tail_count; ++tail)
     {
-        const uint32_t bits = static_cast<uint32_t>(weights[index]) << 16;
+        const uint32_t i = index + tail;
+        const uint32_t bits = static_cast<uint32_t>(weights[i]) << 16;
         float weight = 0.0f;
         std::memcpy(&weight, &bits, sizeof(weight));
-        sum += weight * input[index];
+        sum += weight * input[i];
     }
     return sum;
 }
@@ -461,13 +514,13 @@ __attribute__((target("avx512bf16,avx512f,avx512bw"))) static float avx512bf16_p
     return sum;
 }
 
-__attribute__((target("avx512bf16,avx512f,avx512bw"), always_inline)) static inline void avx512bf16_linear_tile4x4(const uint16_t* weights,
-                                                                                                                   const uint16_t* input,
-                                                                                                                   size_t input_stride,
-                                                                                                                   uint32_t input_columns,
-                                                                                                                   float* output,
-                                                                                                                   size_t output_stride,
-                                                                                                                   size_t valid_rows) noexcept
+__attribute__((target("avx512bf16,avx512f,avx512bw"))) static void avx512bf16_linear_tile4x4(const uint16_t* weights,
+                                                                                             const uint16_t* input,
+                                                                                             size_t input_stride,
+                                                                                             uint32_t input_columns,
+                                                                                             float* output,
+                                                                                             size_t output_stride,
+                                                                                             size_t valid_rows) noexcept
 {
     __m512 sum00 = _mm512_setzero_ps();
     __m512 sum01 = _mm512_setzero_ps();
@@ -539,57 +592,27 @@ __attribute__((target("avx512bf16,avx512f,avx512bw"), always_inline)) static inl
     }
 }
 
-__attribute__((target("avx512bf16,avx512f,avx512bw"), always_inline)) static inline void avx512bf16_linear_tile1x4(const uint16_t* weights,
-                                                                                                                   const uint16_t* input,
-                                                                                                                   uint32_t input_columns,
-                                                                                                                   float* output) noexcept
+static void avx512bf16_batched_linear(const uint16_t* weights,
+                                      const float* input,
+                                      size_t input_stride,
+                                      size_t token_count,
+                                      uint32_t output_columns,
+                                      uint32_t input_columns,
+                                      float* output,
+                                      size_t output_stride,
+                                      int thread_count,
+                                      std::vector<uint16_t>& packed_input)
 {
-    __m512 sum0 = _mm512_setzero_ps();
-    __m512 sum1 = _mm512_setzero_ps();
-    __m512 sum2 = _mm512_setzero_ps();
-    __m512 sum3 = _mm512_setzero_ps();
-    for (uint32_t column = 0; column < input_columns; column += 32)
-    {
-        const __m512bh input_values = (__m512bh)_mm512_loadu_si512(input + column);
-        const __m512bh weight0 = (__m512bh)_mm512_loadu_si512(weights + column);
-        const __m512bh weight1 = (__m512bh)_mm512_loadu_si512(weights + input_columns + column);
-        const __m512bh weight2 = (__m512bh)_mm512_loadu_si512(weights + static_cast<size_t>(input_columns) * 2 + column);
-        const __m512bh weight3 = (__m512bh)_mm512_loadu_si512(weights + static_cast<size_t>(input_columns) * 3 + column);
-        sum0 = _mm512_dpbf16_ps(sum0, input_values, weight0);
-        sum1 = _mm512_dpbf16_ps(sum1, input_values, weight1);
-        sum2 = _mm512_dpbf16_ps(sum2, input_values, weight2);
-        sum3 = _mm512_dpbf16_ps(sum3, input_values, weight3);
-    }
-    output[0] = _mm512_reduce_add_ps(sum0);
-    output[1] = _mm512_reduce_add_ps(sum1);
-    output[2] = _mm512_reduce_add_ps(sum2);
-    output[3] = _mm512_reduce_add_ps(sum3);
-}
-
-__attribute__((target("avx512bf16,avx512f,avx512bw"))) static void avx512bf16_batched_linear(const uint16_t* weights,
-                                                                                             const float* input,
-                                                                                             size_t input_stride,
-                                                                                             size_t token_count,
-                                                                                             uint32_t output_columns,
-                                                                                             uint32_t input_columns,
-                                                                                             float* output,
-                                                                                             size_t output_stride,
-                                                                                             int thread_count,
-                                                                                             std::vector<uint16_t>& packed_input)
-{
-    const size_t padded_token_count = token_count == 1
-                                          ? size_t{1}
-                                          : (token_count + 3) & ~size_t{3};
+#if !defined(_OPENMP)
+    (void)thread_count;
+#endif
+    const size_t padded_token_count = (token_count + 3) & ~size_t{3};
     packed_input.resize(padded_token_count * input_columns);
     for (size_t token = 0; token < token_count; ++token)
     {
         const float* source = input + token * input_stride;
         uint16_t* destination = packed_input.data() + token * input_columns;
-        for (uint32_t column = 0; column < input_columns; column += 16)
-        {
-            const __m256i packed = (__m256i)_mm512_cvtneps_pbh(_mm512_loadu_ps(source + column));
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(destination + column), packed);
-        }
+        avx512bf16_float_to_bfloat16_array(destination, source, input_columns);
     }
     std::fill(packed_input.begin() + token_count * input_columns,
               packed_input.end(),
@@ -597,20 +620,6 @@ __attribute__((target("avx512bf16,avx512f,avx512bw"))) static void avx512bf16_ba
 
     const uint16_t* packed_input_data = packed_input.data();
     const int64_t output_groups = output_columns / 4;
-    if (token_count == 1)
-    {
-#pragma omp parallel for num_threads(thread_count) if (thread_count > 1)
-        for (int64_t output_group = 0; output_group < output_groups;
-             ++output_group)
-        {
-            const uint32_t first_output = static_cast<uint32_t>(output_group) * 4;
-            avx512bf16_linear_tile1x4(weights + static_cast<size_t>(first_output) * input_columns,
-                                      packed_input_data,
-                                      input_columns,
-                                      output + first_output);
-        }
-        return;
-    }
 #pragma omp parallel for num_threads(thread_count) if (thread_count > 1)
     for (int64_t output_group = 0; output_group < output_groups; ++output_group)
     {
@@ -656,38 +665,34 @@ static float scalar_bfloat16_pair_dot(const uint16_t* left,
 
 // Scoped instrumentation context only. Model weights, activation scratch,
 // scheduling, and session state never use thread-local storage.
-static thread_local Bfloat16BatchedLinearExecutionCounter* current_bfloat16_execution_counter = nullptr;
+static thread_local Bf16Counter* active_bf16_counter = nullptr;
 
-uint64_t Bfloat16BatchedLinearExecutionCounter::dispatch_count() const noexcept
+uint64_t Bf16Counter::dispatches() const noexcept
 {
     return count.load(std::memory_order_relaxed);
 }
 
-ScopedBfloat16BatchedLinearExecutionCounter::
-    ScopedBfloat16BatchedLinearExecutionCounter(Bfloat16BatchedLinearExecutionCounter* counter) noexcept
-    : previous(current_bfloat16_execution_counter)
+Bf16Scope::Bf16Scope(Bf16Counter* counter) noexcept
+    : previous(active_bf16_counter)
 {
-    current_bfloat16_execution_counter = counter;
+    active_bf16_counter = counter;
 }
 
-ScopedBfloat16BatchedLinearExecutionCounter::
-    ~ScopedBfloat16BatchedLinearExecutionCounter()
+Bf16Scope::~Bf16Scope()
 {
-    current_bfloat16_execution_counter = previous;
+    active_bf16_counter = previous;
 }
 
-Bfloat16BatchedLinearExecutionCounter*
-current_bfloat16_batched_linear_execution_counter() noexcept
+Bf16Counter* current_bf16_counter() noexcept
 {
-    return current_bfloat16_execution_counter;
+    return active_bf16_counter;
 }
 
-void record_bfloat16_batched_linear_dispatch() noexcept
+void record_bf16_dispatch() noexcept
 {
-    if (current_bfloat16_execution_counter)
+    if (active_bf16_counter)
     {
-        current_bfloat16_execution_counter->count.fetch_add(1,
-                                                            std::memory_order_relaxed);
+        active_bf16_counter->count.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -773,8 +778,12 @@ const char* bfloat16_dot_kernel_name() noexcept
 
 float bfloat16_dot(const uint16_t* weights, const float* input, uint32_t count) noexcept
 {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return neon_bfloat16_dot(weights, input, count);
+#else
     static const Bfloat16DotFunction function = select_bfloat16_dot();
     return function(weights, input, count);
+#endif
 }
 
 void float_to_bfloat16_array(uint16_t* output,
@@ -865,7 +874,7 @@ bool forward_linear_bf16(const uint16_t* weights,
                                                      input_columns,
                                                      output,
                                                      std::max(1, thread_count));
-            record_bfloat16_batched_linear_dispatch();
+            record_bf16_dispatch();
             return true;
         }
         msvc_avx512_bfloat16_batched_linear(weights,
@@ -878,7 +887,7 @@ bool forward_linear_bf16(const uint16_t* weights,
                                             output_stride,
                                             std::max(1, thread_count),
                                             packed_input);
-        record_bfloat16_batched_linear_dispatch();
+        record_bf16_dispatch();
         return true;
     }
 #elif (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
@@ -886,13 +895,34 @@ bool forward_linear_bf16(const uint16_t* weights,
     {
         if (token_count == 1)
         {
-            avx512_bfloat16_single_token_linear(weights,
-                                                input,
-                                                output_columns,
-                                                input_columns,
-                                                output,
-                                                std::max(1, thread_count));
-            record_bfloat16_batched_linear_dispatch();
+#if defined(_OPENMP)
+            const int team_size = std::max(1, thread_count);
+            if (team_size > 1)
+            {
+                const int64_t output_groups = output_columns / 4;
+#pragma omp parallel for num_threads(team_size)
+                for (int64_t output_group = 0; output_group < output_groups;
+                     ++output_group)
+                {
+                    const uint32_t first_output = static_cast<uint32_t>(output_group) * 4;
+                    const uint16_t* group_weights = weights + static_cast<size_t>(first_output) * input_columns;
+                    avx512_bfloat16_single_token_linear(group_weights,
+                                                        input,
+                                                        4,
+                                                        input_columns,
+                                                        output + first_output);
+                }
+            }
+            else
+#endif
+            {
+                avx512_bfloat16_single_token_linear(weights,
+                                                    input,
+                                                    output_columns,
+                                                    input_columns,
+                                                    output);
+            }
+            record_bf16_dispatch();
             return true;
         }
         avx512bf16_batched_linear(weights,
@@ -905,7 +935,7 @@ bool forward_linear_bf16(const uint16_t* weights,
                                   output_stride,
                                   std::max(1, thread_count),
                                   packed_input);
-        record_bfloat16_batched_linear_dispatch();
+        record_bf16_dispatch();
         return true;
     }
 #else

@@ -148,7 +148,7 @@ static std::shared_ptr<DeviceTensor_vulkan> shared_upload(const ActivationBuffer
     identity.float32_data.assign(static_cast<size_t>(input.columns()) * input.columns(), 0.0f);
     for (uint32_t column = 0; column < input.columns(); ++column)
         identity.float32_data[static_cast<size_t>(column) * input.columns() + column] = 1.0f;
-    auto seed = Linear::create(identity, nullptr, LinearDevice::Vulkan, 0, runtime, OptimizationDefaultFlags);
+    auto seed = Linear::create(identity, nullptr, 0, runtime, OptimizationDefaultFlags);
     shared_check(static_cast<bool>(seed), "resident Shared input producer");
     auto graph = CommandGraph_vulkan::create(*seed);
     auto result = std::make_shared<DeviceTensor_vulkan>();

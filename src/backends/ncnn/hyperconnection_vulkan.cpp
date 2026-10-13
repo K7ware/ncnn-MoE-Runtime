@@ -220,7 +220,7 @@ std::shared_ptr<HyperConnection_vulkan> HyperConnection_vulkan::create(const Ten
     std::memcpy(function_host.data, function.float32_values().data(), static_cast<size_t>(function.element_count()) * sizeof(float));
     std::memcpy(scale_host.data, scale.float32_values().data(), scale_host.total() * sizeof(float));
     std::memcpy(base_host.data, base.float32_values().data(), base_host.total() * sizeof(float));
-    ncnn::VkCompute cmd(context->device(), context->command_optimization_flags());
+    ncnn::VkCompute cmd(context->device());
     // record_upload packs a 2-D matrix along its rows even when packing layout is disabled.
     // These shaders address the original row-major FP32 values, so preserve pack1 storage.
     cmd.record_clone(function_host, implementation.function, implementation.opt);

@@ -170,8 +170,7 @@ public:
     {
         VulkanRuntimeState& runtime_state = vulkan_context->runtime_state();
         std::unique_lock<std::mutex> lock(vulkan_context->command_mutex());
-        ncnn::VkCompute cmd(vulkan_context->device(),
-                            vulkan_context->command_optimization_flags());
+        ncnn::VkCompute cmd(vulkan_context->device());
         cmd.record_clone(snapshot_convolution, convolution, opt);
         cmd.record_clone(snapshot_recurrent, recurrent, opt);
         if (submit_compute_and_wait(cmd, vulkan_context->device()) != 0)

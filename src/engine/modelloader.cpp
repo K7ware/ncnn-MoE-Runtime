@@ -415,7 +415,9 @@ Result<void> ModelLoader::compile_model()
     }
     if (requested_gpu_cache_size != 0
         || use_auto_gpu_cache
-        || (use_vulkan_compute && has_flag(opt.optimization_flags, OptimizationVulkanQnK)))
+        || (use_vulkan_compute
+            && has_flag(opt.optimization_flags, OptimizationVulkanQnK)
+            && !has_flag(opt.flags, OptionDisableGpuExpertExecution)))
     {
         compiler_opt.flags |= BackendVulkanExperts;
     }
@@ -674,6 +676,7 @@ Result<void> ModelLoader::configure_expert_cache()
 Result<void> ModelLoader::configure_resident_qnk_backend()
 {
     if (opt.hybrid_mode != HybridMode::HybridExperts
+        || has_flag(opt.flags, OptionDisableGpuExpertExecution)
         || !has_flag(model.opt.optimization_flags, OptimizationVulkanQnK)
         || model.expert_backend)
     {

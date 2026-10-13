@@ -24,30 +24,21 @@ class VulkanContext;
 class VulkanWeightUploadBatch;
 class GatedDeltaNet_vulkan;
 
-enum class LinearDevice
-{
-    Cpu,
-    Vulkan
-};
-
 class Linear
 {
 public:
     ~Linear();
 
     [[nodiscard]] static std::shared_ptr<Linear> create(const TensorData& matrix, const TensorData* bias,
-                                                        LinearDevice device,
                                                         uint32_t vulkan_device_index,
                                                         const VulkanRuntimePtr& vulkan_runtime,
                                                         uint64_t optimization_flags);
     [[nodiscard]] static std::shared_ptr<Linear> create_fused(const std::vector<const TensorData*>& matrices,
-                                                              const std::vector<const TensorData*>& biases, LinearDevice device,
+                                                              const std::vector<const TensorData*>& biases,
                                                               uint32_t vulkan_device_index,
                                                               const VulkanRuntimePtr& vulkan_runtime,
                                                               uint64_t optimization_flags);
-    [[nodiscard]] static const char* cpu_small_bfloat16_linear_policy(uint64_t optimization_flags) noexcept;
     [[nodiscard]] bool forward(const ActivationBuffer& input, ActivationBuffer& output) const;
-    [[nodiscard]] bool uses_vulkan() const noexcept;
 
 private:
     friend class CommandGraph_vulkan;
@@ -69,10 +60,8 @@ private:
     std::unique_ptr<Implementation> d;
 };
 
-// A small graph-level bridge for generic ncnn Linear operators.  Tensors stay
-// in Vulkan storage until the caller explicitly requests a download.  This is
-// intentionally narrower than the model executor: it provides a reusable
-// lifetime/synchronization contract while keeping the existing CPU fallback.
+// A small graph-level bridge for ncnn Vulkan Linear operators. Tensors stay
+// in Vulkan storage until the caller explicitly requests a download.
 class DeviceTensor_vulkan
 {
 public:

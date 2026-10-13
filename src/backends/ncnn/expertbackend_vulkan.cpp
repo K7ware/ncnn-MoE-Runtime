@@ -431,7 +431,7 @@ bool VulkanExpertVictimCache::download(const DeviceEntry& entry, const TensorDat
         option.blob_vkallocator = slot.staging_allocator;
         option.workspace_vkallocator = slot.staging_allocator;
         option.staging_vkallocator = slot.staging_allocator;
-        ncnn::VkCompute command(context->device(), context->command_optimization_flags());
+        ncnn::VkCompute command(context->device());
         command.record_clone(entry.data, slot.staging, option);
         if (slot.staging.empty() || submit_compute_and_wait(command, context->device()) != 0)
         {

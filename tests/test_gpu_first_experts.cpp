@@ -771,9 +771,9 @@ static void gpu_first_aligned_batch_outputs()
     identity.shape = {7, 7};
     identity.float32_data.assign(49, 0.0f);
     for (size_t column = 0; column < 7; ++column) identity.float32_data[column * 7 + column] = 1.0f;
-    auto identity_op = Linear::create(identity, nullptr, LinearDevice::Vulkan, 0, fixture.runtime, fixture.flags);
+    auto identity_op = Linear::create(identity, nullptr, 0, fixture.runtime, fixture.flags);
     gpu_first_check(static_cast<bool>(identity_op), "odd-width device output consumer");
-    const auto foreign_op = Linear::create(identity, nullptr, LinearDevice::Vulkan, 0, create_vulkan_runtime(), fixture.flags);
+    const auto foreign_op = Linear::create(identity, nullptr, 0, create_vulkan_runtime(), fixture.flags);
     gpu_first_check(static_cast<bool>(foreign_op), "completed output foreign consumer");
     for (bool retain : {false, true})
     {
@@ -864,7 +864,7 @@ static void gpu_first_upload_host_scratch()
     }
     {
         const std::lock_guard<std::mutex> lock(context->command_mutex());
-        ncnn::VkCompute download(context->device(), context->command_optimization_flags());
+        ncnn::VkCompute download(context->device());
         ncnn::Mat first;
         ncnn::Mat second;
         download.record_download(first_destination, first, option);
@@ -1067,7 +1067,7 @@ static std::shared_ptr<const DeviceTensor_vulkan> gpu_first_upload_normalized(co
     identity.float32_data.assign(static_cast<size_t>(input.columns()) * input.columns(), 0.0f);
     for (uint32_t column = 0; column < input.columns(); ++column)
         identity.float32_data[static_cast<size_t>(column) * input.columns() + column] = 1.0f;
-    const auto seed = Linear::create(identity, nullptr, LinearDevice::Vulkan, 0, runtime, flags);
+    const auto seed = Linear::create(identity, nullptr, 0, runtime, flags);
     gpu_first_check(static_cast<bool>(seed), "GPU-first normalized input seed");
     auto command = CommandGraph_vulkan::create(*seed);
     auto device = std::make_shared<DeviceTensor_vulkan>();
@@ -1221,6 +1221,193 @@ static void gpu_first_lazy_host_input()
         state.reset();
     }
     gpu_first_check(model.expert_backend->statistics().execution_failures != 0, "foreign context exercises failed GPU fallback");
+
+    moe.experts.back().cache_key = "lazy-9";
+    auto priority_off_backend = create_vulkan_expert_backend(fixture.size, 0, {}, fixture.runtime, fixture.flags);
+    gpu_first_check(static_cast<bool>(priority_off_backend), "priority-off backend creation");
+    model.expert_backend = priority_off_backend;
+    model.opt.optimization_flags = fixture.flags & ~OptimizationVulkanExpertGpuPriority;
+    model.opt.flags = 0;
+    std::shared_ptr<const void> resident_pin;
+    {
+        ScopedExpertBackendForeground priority_foreground(priority_off_backend);
+        gpu_first_check(fixture.demand(*priority_off_backend, moe.experts.front().cache_key, resident_pin)
+                            && resident_pin,
+                        "priority-off fixture pins only Expert0 on GPU");
+        gpu_first_check(priority_off_backend->statistics().resident_size == fixture.size,
+                        "priority-off fixture has one resident Expert pair");
+
+        for (size_t scenario = 0; scenario < 3; ++scenario)
+        {
+            const size_t token_count = scenario == 0 ? 32 : 65;
+            const bool foreign = scenario == 2;
+            state.reset();
+            state.normalized.reset(token_count, 32, false);
+            for (size_t row = 0; row < token_count; ++row)
+                for (uint32_t column = 0; column < state.normalized.columns(); ++column)
+                    state.normalized.row(row)[column] = static_cast<float>(static_cast<int>((row * 7 + column * 3 + scenario) % 19) - 9) * 0.015625f;
+            state.normalized_device = gpu_first_upload_normalized(state.normalized,
+                                                                  foreign ? create_vulkan_runtime() : fixture.runtime,
+                                                                  fixture.flags);
+            for (size_t index = 0; index < expert_count; ++index)
+            {
+                ExpertState& active = state.active_experts()[index];
+                active.batch.expert_id = static_cast<uint32_t>(index);
+                const size_t route_count = index == 0 ? token_count : 2;
+                active.batch.routes.resize(route_count);
+                for (size_t row = 0; row < route_count; ++row)
+                {
+                    const uint32_t token = static_cast<uint32_t>(index == 0
+                                                                     ? row
+                                                                     : (row * 3 + index) % token_count);
+                    active.batch.routes[row] = {token, 0, 1.0f};
+                }
+                active.input.reset(route_count, 32, false);
+                std::fill_n(active.input.row(0), active.input.values().size(), 123.0f);
+                active.output.reset(route_count, 32, false);
+                std::fill_n(active.output.row(0), active.output.values().size(), -91.0f);
+                active.device_output.reset();
+            }
+
+            const ExpertBackendStatistics before = priority_off_backend->statistics();
+            const auto result = forward_moe(model, moe, state, statistics, scratch, 0,
+                                            ExecutionBackend::Vulkan, false);
+            const ExpertBackendStatistics after = priority_off_backend->statistics();
+            gpu_first_check(static_cast<bool>(result), "priority-off high-row mixed Expert forward completed");
+            gpu_first_check(foreign ? after.execution_failures == before.execution_failures + 1
+                                    : after.executions == before.executions + 1,
+                            foreign ? "foreign normalized input fails the resident GPU request"
+                                    : "priority-off executes exactly the resident Expert on GPU");
+            if (!foreign)
+                gpu_first_check(!scratch.backend_aggregated_output_valid,
+                                "partial resident coverage keeps per-Expert outputs for later aggregation");
+
+            for (size_t index = 0; index < expert_count; ++index)
+            {
+                const ExpertState& active = state.active_experts()[index];
+                ActivationBuffer gathered(active.batch.routes.size(), 32);
+                for (size_t row = 0; row < active.batch.routes.size(); ++row)
+                    std::copy_n(state.normalized.row(active.batch.routes[row].token_index), 32, gathered.row(row));
+                const bool gpu = !foreign && index == 0;
+                const uint64_t oracle_flags = gpu ? fixture.flags & ~OptimizationCpuMxfp4Q8 : fixture.flags;
+                ActivationBuffer activated;
+                forward_gate_up_mxfp4(*fixture.gate, nullptr, gathered, ExpertActivation::DeepSeekSwiGlu,
+                                      4.0f, activated, oracle_flags);
+                const ActivationBuffer expected = forward_linear(*fixture.down, activated, oracle_flags);
+                ActivationBuffer materialized;
+                const ActivationBuffer* actual = &active.output;
+                if (gpu)
+                {
+                    gpu_first_check(active.input.rows() == 0 && active.device_output,
+                                    "resident GPU Expert consumes device routes without gathered Host input");
+                    gpu_first_check(MoeCombine_vulkan::materialize(*active.device_output, materialized),
+                                    "priority-off GPU output remains owned until Host materialization");
+                    actual = &materialized;
+                }
+                else
+                {
+                    gpu_first_check(active.input.rows() == gathered.rows() && !active.device_output,
+                                    "CPU fallback lazily gathers Host input and has no device output");
+                    for (size_t value = 0; value < gathered.values().size(); ++value)
+                        gpu_first_check(active.input.values()[value] == gathered.values()[value],
+                                        "CPU fallback replaces poisoned Host input");
+                }
+                gpu_first_check(actual->rows() == expected.rows() && actual->columns() == expected.columns(),
+                                "priority-off high-row output shape");
+                for (size_t value = 0; value < expected.values().size(); ++value)
+                    gpu_first_check(std::isfinite(actual->values()[value])
+                                        && std::abs(actual->values()[value] - expected.values()[value]) < 0.000001f,
+                                    "priority-off high-row Expert output matches CPU oracle");
+            }
+            gpu_first_check(scratch.backend_requests.empty(), "priority-off wave releases request storage");
+        }
+    }
+    model.opt.optimization_flags = fixture.flags;
+
+    std::shared_ptr<const void> disabled_pin;
+    gpu_first_check(fixture.demand(*model.expert_backend, moe.experts.front().cache_key, disabled_pin)
+                        && disabled_pin,
+                    "disabled-execution fixture keeps one Expert resident on GPU");
+    gpu_first_check(model.expert_backend->statistics().resident_size >= fixture.size,
+                    "disabled-execution test starts with a resident GPU weight pair");
+
+    const std::array<size_t, 3> token_counts = {4, 32, 65};
+    for (size_t disabled_case = 0; disabled_case < 3; ++disabled_case)
+    {
+        const size_t token_count = token_counts[disabled_case];
+        const size_t routed_rows = disabled_case == 2 ? 65 : 32;
+        state.reset();
+        state.normalized.reset(token_count, 32, false);
+        for (size_t row = 0; row < token_count; ++row)
+            for (uint32_t column = 0; column < state.normalized.columns(); ++column)
+                state.normalized.row(row)[column] = static_cast<float>(static_cast<int>((row * 7 + column * 3 + disabled_case) % 19) - 9) * 0.015625f;
+        state.normalized_device = gpu_first_upload_normalized(state.normalized, fixture.runtime, fixture.flags);
+        size_t total_routes = 0;
+        for (size_t index = 0; index < expert_count; ++index)
+        {
+            ExpertState& active = state.active_experts()[index];
+            active.batch.expert_id = static_cast<uint32_t>(index);
+            const size_t route_count = index == 0 ? routed_rows : 2;
+            total_routes += route_count;
+            gpu_first_check(!moe.experts[index].cache_key.empty(), "disabled-execution Experts have demand keys");
+            active.batch.routes.resize(route_count);
+            for (size_t row = 0; row < route_count; ++row)
+            {
+                const uint32_t token = static_cast<uint32_t>(index == 0
+                                                                 ? row % token_count
+                                                                 : (row * 3 + index) % token_count);
+                active.batch.routes[row] = {token, 0, 1.0f};
+            }
+            active.input.reset(route_count, 32, false);
+            std::fill_n(active.input.row(0), active.input.values().size(), 123.0f);
+            active.output.reset(route_count, 32, false);
+            std::fill_n(active.output.row(0), active.output.values().size(), -91.0f);
+            active.device_output.reset();
+        }
+        gpu_first_check(total_routes >= 32, "disabled-execution prefill exceeds the routed-row admission boundary");
+        model.opt.flags = OptionDisableGpuExpertExecution;
+        const ExpertBackendStatistics before = model.expert_backend->statistics();
+        const auto result = forward_moe(model, moe, state, statistics, scratch, 0, ExecutionBackend::Vulkan, false);
+        const ExpertBackendStatistics after = model.expert_backend->statistics();
+        gpu_first_check(after.executions == before.executions && after.admissions == before.admissions,
+                        "GPU Expert execution disable prevents using resident GPU weights");
+        gpu_first_check(static_cast<bool>(result), "GPU-disabled prefill completes through CPU Experts");
+
+        for (size_t index = 0; index < expert_count; ++index)
+        {
+            const ExpertState& active = state.active_experts()[index];
+            ActivationBuffer gathered(active.batch.routes.size(), 32);
+            for (size_t row = 0; row < active.batch.routes.size(); ++row)
+                std::copy_n(state.normalized.row(active.batch.routes[row].token_index), 32, gathered.row(row));
+            ActivationBuffer activated;
+            forward_gate_up_mxfp4(*fixture.gate,
+                                  nullptr,
+                                  gathered,
+                                  ExpertActivation::DeepSeekSwiGlu,
+                                  4.0f,
+                                  activated,
+                                  fixture.flags);
+            const ActivationBuffer expected = forward_linear(*fixture.down, activated, fixture.flags);
+            gpu_first_check(active.input.rows() == gathered.rows() && !active.device_output
+                                && !active.lease.gate_up && !active.lease.down,
+                            "GPU-disabled Expert regathers input and releases backend owners");
+            gpu_first_check(active.output.rows() == expected.rows()
+                                && active.output.columns() == expected.columns(),
+                            "GPU-disabled Expert output shape");
+            for (size_t value = 0; value < gathered.values().size(); ++value)
+                gpu_first_check(active.input.values()[value] == gathered.values()[value],
+                                "GPU-disabled Expert replaces poisoned Host input");
+            for (size_t value = 0; value < expected.values().size(); ++value)
+                gpu_first_check(std::isfinite(active.output.values()[value])
+                                    && std::abs(active.output.values()[value] - expected.values()[value]) < 0.000001f,
+                                "GPU-disabled Expert output matches CPU oracle");
+        }
+        gpu_first_check(scratch.backend_requests.empty() && scratch.prestaged_demands.empty() && scratch.prestaged_pins.empty()
+                            && scratch.prestaged_cache_leases.empty() && scratch.current_wave_requests.empty()
+                            && scratch.next_wave_requests.empty() && scratch.wave_demands.empty()
+                            && scratch.prepared_pins.empty(),
+                        "GPU-disabled prefill leaves no submitted backend owners");
+    }
 }
 
 // Force the transfer staging path even on unified or host-visible heaps while
@@ -1381,7 +1568,7 @@ static void gpu_first_upload_staging_pool()
     upload();
     {
         const std::lock_guard<std::mutex> lock(context->command_mutex());
-        ncnn::VkCompute command(context->device(), context->command_optimization_flags());
+        ncnn::VkCompute command(context->device());
         ncnn::Mat downloaded;
         option.staging_vkallocator = context->staging_allocator();
         command.record_download(destination, downloaded, option);

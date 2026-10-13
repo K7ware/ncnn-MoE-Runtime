@@ -472,8 +472,8 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
     if (!model.speculative.enabled()
         || !state.use_speculative_context)
         return {};
-    Bfloat16BatchedLinearExecutionCounter cpu_bfloat16_execution;
-    const ScopedBfloat16BatchedLinearExecutionCounter cpu_bfloat16_scope(&cpu_bfloat16_execution);
+    Bf16Counter bf16;
+    const Bf16Scope bf16_scope(&bf16);
     VulkanStatistics vulkan_before;
     if (model.vulkan_runtime)
         vulkan_before = get_vulkan_statistics(model.vulkan_runtime);
@@ -488,7 +488,7 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
             const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
             record_vulkan_execution_delta(statistics, vulkan_before, vulkan_after);
         }
-        statistics.cpu_bfloat16_batched_linear_dispatches += cpu_bfloat16_execution.dispatch_count();
+        statistics.cpu_bfloat16_batched_linear_dispatches += bf16.dispatches();
         return {};
     }
     const uint32_t expected_columns = model.descriptor.hidden_size
@@ -551,7 +551,7 @@ Result<void> update_speculative_context(const CompiledModel& model, SessionStati
         const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
         record_vulkan_execution_delta(statistics, vulkan_before, vulkan_after);
     }
-    statistics.cpu_bfloat16_batched_linear_dispatches += cpu_bfloat16_execution.dispatch_count();
+    statistics.cpu_bfloat16_batched_linear_dispatches += bf16.dispatches();
     return {};
 }
 
@@ -614,6 +614,7 @@ static Result<SpeculativeProposal> propose_mtp(const CompiledModel& model,
     proposal.confidence_logits.reserve(model.speculative.block_size);
     proposal.committed_context_rows = 1;
     ActivationBuffer previous_hidden = state.mtp_pending_target_hidden;
+    ActivationBuffer logits;
     int32_t previous_token = input_id;
     for (uint32_t row = 0;
          row < model.speculative.block_size;
@@ -626,10 +627,11 @@ static Result<SpeculativeProposal> propose_mtp(const CompiledModel& model,
                                       state.mtp_pending_target_position + row, statistics, state);
         if (!mtp_hidden)
             return mtp_hidden.error();
-        ActivationBuffer logits = forward_linear(model.weights.at(model.lm_head_weight),
-                                                 mtp_hidden.value(),
-                                                 model.opt.optimization_flags,
-                                                 model.operators.find_weight(model.lm_head_weight));
+        forward_linear(model.weights.at(model.lm_head_weight),
+                       mtp_hidden.value(),
+                       logits,
+                       model.opt.optimization_flags,
+                       model.operators.find_weight(model.lm_head_weight));
         std::vector<float> row_logits(logits.row(0),
                                       logits.row(0) + logits.columns());
         auto sampled = sampler(row_logits);
@@ -673,8 +675,8 @@ Result<SpeculativeProposal> propose_speculative(const CompiledModel& model, int3
             ErrorCode::UnsupportedModel,
             "the model does not provide a speculative execution plan"};
     }
-    Bfloat16BatchedLinearExecutionCounter cpu_bfloat16_execution;
-    const ScopedBfloat16BatchedLinearExecutionCounter cpu_bfloat16_scope(&cpu_bfloat16_execution);
+    Bf16Counter bf16;
+    const Bf16Scope bf16_scope(&bf16);
     if (model.speculative.kind == SpeculativeModelKind::Mtp)
     {
         auto proposal = propose_mtp(model,
@@ -685,7 +687,7 @@ Result<SpeculativeProposal> propose_speculative(const CompiledModel& model, int3
                                     sampler);
         if (proposal)
         {
-            statistics.cpu_bfloat16_batched_linear_dispatches += cpu_bfloat16_execution.dispatch_count();
+            statistics.cpu_bfloat16_batched_linear_dispatches += bf16.dispatches();
         }
         return proposal;
     }
@@ -842,7 +844,7 @@ Result<SpeculativeProposal> propose_speculative(const CompiledModel& model, int3
         const VulkanStatistics vulkan_after = get_vulkan_statistics(model.vulkan_runtime);
         record_vulkan_execution_delta(statistics, vulkan_before, vulkan_after);
     }
-    statistics.cpu_bfloat16_batched_linear_dispatches += cpu_bfloat16_execution.dispatch_count();
+    statistics.cpu_bfloat16_batched_linear_dispatches += bf16.dispatches();
     ++statistics.speculative_proposals;
     statistics.speculative_draft_tokens += proposal.token_ids.size();
     return proposal;

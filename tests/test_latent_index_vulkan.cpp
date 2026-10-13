@@ -71,7 +71,7 @@ static void index_test(const std::vector<float>& values, uint32_t top_k, const s
     std::copy(values.begin(), values.end(), host.row(0));
     ncnn::VkMat staging;
     ncnn::VkMat scores;
-    ncnn::VkCompute command(context->device(), context->command_optimization_flags());
+    ncnn::VkCompute command(context->device());
     index_check(fill_staging_upload(host, staging, context->staging_allocator()), label + ": scores staging");
     index_check(record_prepared_staging_upload(staging, 1, scores, command, context->device(), option), label + ": scores upload");
     uint32_t runs = std::max(1u, (count + 1023u) / 1024u);

@@ -1,6 +1,7 @@
 #include "modelpipeline.h"
 
 #include "kernels/qnk.h"
+#include "kernels/bfloat16.h"
 #include "linear.h"
 #include "attention_vulkan.h"
 #include "latentattention_vulkan.h"
@@ -78,7 +79,6 @@ static Result<void> prepare_vulkan_linear_operator(WeightStore& weights,
     }
     compiled_operator.linear = Linear::create(matrix,
                                               bias,
-                                              LinearDevice::Vulkan,
                                               vulkan_device_index,
                                               vulkan_runtime,
                                               optimization_flags);
@@ -271,7 +271,7 @@ static bool uses_vulkan_dense_operator(const CompiledOperator& executable) noexc
 {
     return executable.bfloat16
            || executable.float8
-           || (executable.linear && executable.linear->uses_vulkan());
+           || static_cast<bool>(executable.linear);
 }
 
 bool support_vulkan_attention(const CompiledOperatorTable& operators,
@@ -555,7 +555,6 @@ static Result<void> prepare_vulkan_qkv_operator(CompiledModel& compiled,
     }
     auto fused_operator = Linear::create_fused(qkv_matrices,
                                                qkv_biases,
-                                               LinearDevice::Vulkan,
                                                layer_plan.vulkan_device_index,
                                                compiled.vulkan_runtime,
                                                compiled.opt.optimization_flags);

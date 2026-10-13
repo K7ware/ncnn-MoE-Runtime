@@ -855,7 +855,7 @@ bool LatentAttention_vulkan::forward_projected_batch(const ActivationBuffer& inp
     if (!d->prepared || input.rows() == 0 || input.rows() != positions.size() || input.rows() != caches.size())
         return false;
     const std::lock_guard<std::mutex> lock(d->context->command_mutex());
-    ncnn::VkCompute cmd(d->context->device(), d->context->command_optimization_flags());
+    ncnn::VkCompute cmd(d->context->device());
     ncnn::VkMat input_staging;
     ncnn::VkMat device_input;
     ncnn::VkMat device_output;
@@ -973,7 +973,7 @@ bool LatentAttention_vulkan::prepare(const WeightStore& weights, const CompiledO
         (void)create_latent_pipeline(implementation.context, implementation.opt, latent_attention_index_merge_shader,
                                      static_cast<int>(sizeof(latent_attention_index_merge_shader) - 1), implementation.index_merge_pipeline);
     }
-    ncnn::VkCompute cmd(implementation.context->device(), implementation.context->command_optimization_flags());
+    ncnn::VkCompute cmd(implementation.context->device());
     std::vector<ncnn::VkMat> staging;
     const auto upload_constant = [&](const TensorData& tensor, uint64_t count, ncnn::VkMat& destination) {
         std::vector<float> values;

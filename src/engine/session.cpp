@@ -86,7 +86,9 @@ Session::~Session() = default;
 
 void Session::commit_execution(uint64_t prefill_tokens, uint64_t decode_tokens)
 {
-    std::swap(stats, stats_scratch);
+    std::vector<uint64_t> counts = std::move(stats.expert_token_counts);
+    stats = std::move(stats_scratch);
+    stats_scratch.expert_token_counts = std::move(counts);
     stats.prefill_tokens += prefill_tokens;
     stats.decode_tokens += decode_tokens;
     token_count += prefill_tokens + decode_tokens;
@@ -363,11 +365,7 @@ Result<GenerationResult> Session::generate_unlocked(std::span<const int32_t> inp
         return prefill_result.error();
 
     if (use_speculative)
-    {
-        const std::span<const float> initial_logits = state->logits.values();
-        std::vector<float> logits(initial_logits.begin(), initial_logits.end());
-        return generate_speculative(std::move(logits), opt, on_token, decode_text, lock);
-    }
+        return generate_speculative(opt, on_token, decode_text, lock);
 
     GenerationResult result;
     result.tokens.reserve(opt.max_new_tokens);
@@ -407,17 +405,17 @@ Result<GenerationResult> Session::generate_unlocked(std::span<const int32_t> inp
     return result;
 }
 
-Result<GenerationResult> Session::generate_speculative(std::vector<float> logits, const GenerationOptions& opt, const TokenStreamCallback& on_token, const TokenTextDecoder& decode_text, std::unique_lock<std::mutex>& lock)
+Result<GenerationResult> Session::generate_speculative(const GenerationOptions& opt, const TokenStreamCallback& on_token, const TokenTextDecoder& decode_text, std::unique_lock<std::mutex>& lock)
 {
     const CompiledModel& compiled = model_compiled(*model);
     GenerationResult result;
     result.tokens.reserve(opt.max_new_tokens);
-    const bool state_cache_transactions = compiled.speculative.kind
-                                          == SpeculativeModelKind::Mtp;
-    const auto begin_cache_transaction =
-        [state_cache_transactions](std::span<LayerCache> caches,
-                                   size_t expected_rows) -> Result<void> {
-        if (state_cache_transactions)
+    const bool use_mtp = compiled.speculative.kind
+                         == SpeculativeModelKind::Mtp;
+    const auto begin_cache =
+        [use_mtp](std::span<LayerCache> caches,
+                  size_t expected_rows) -> Result<void> {
+        if (use_mtp)
         {
             return begin_state_cache_transaction(caches,
                                                  expected_rows);
@@ -425,12 +423,12 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
         begin_latent_cache_transaction(caches);
         return {};
     };
-    const auto finish_cache_transaction =
-        [this, state_cache_transactions](std::span<LayerCache> caches,
-                                         size_t committed_rows) -> Result<void> {
+    const auto finish_cache =
+        [this, use_mtp](std::span<LayerCache> caches,
+                        size_t committed_rows) -> Result<void> {
         const bool previous_execution_failure = state->execution_failed;
         state->execution_failed = true;
-        auto finished = state_cache_transactions
+        auto finished = use_mtp
                             ? finish_state_cache_transaction(caches,
                                                              committed_rows)
                             : finish_latent_cache_transaction(caches,
@@ -441,7 +439,7 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
     };
     try
     {
-        auto initial = sample_unlocked(logits, opt.sampling);
+        auto initial = sample_unlocked(state->logits.values(), opt.sampling);
         if (!initial)
             return initial.error();
         StreamToken initial_token;
@@ -464,6 +462,7 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
             return result;
         }
 
+        std::vector<ActivationBuffer> logits;
         bool speculative_active = true;
         while (result.tokens.size() < opt.max_new_tokens)
         {
@@ -498,8 +497,8 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
                 }
                 continue;
             }
-            auto draft_transaction = begin_cache_transaction(state->speculative_layers,
-                                                             compiled.speculative.block_size);
+            auto draft_transaction = begin_cache(state->speculative_layers,
+                                                 compiled.speculative.block_size);
             if (!draft_transaction)
                 return draft_transaction.error();
             auto proposed = propose_speculative(compiled,
@@ -515,10 +514,10 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
                                                         return sampled.error();
                                                     return sampled.value().token_id;
                                                 });
-            auto discarded_draft_cache = finish_cache_transaction(state->speculative_layers,
-                                                                  proposed
-                                                                      ? proposed.value().committed_context_rows
-                                                                      : 0);
+            auto discarded_draft_cache = finish_cache(state->speculative_layers,
+                                                      proposed
+                                                          ? proposed.value().committed_context_rows
+                                                          : 0);
             if (!discarded_draft_cache)
                 return discarded_draft_cache.error();
             if (!proposed)
@@ -561,13 +560,12 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
                                     proposed.value().token_ids.begin() + draft_count);
 
             stats_scratch = stats;
-            auto target_transaction = begin_cache_transaction(state->layers,
-                                                              verify_input_ids.size());
+            auto target_transaction = begin_cache(state->layers,
+                                                  verify_input_ids.size());
             if (!target_transaction)
                 return target_transaction.error();
-            auto execute_target_verify =
-                [&]() -> Result<std::vector<std::vector<float>>> {
-                if (!state_cache_transactions)
+            auto forward = [&]() -> Result<void> {
+                if (!use_mtp)
                 {
                     auto executed = forward_model(compiled,
                                                   verify_input_ids,
@@ -577,13 +575,20 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
                                                   LogitsOutput::All);
                     if (!executed)
                         return executed.error();
-                    return batch_to_vectors(state->logits);
+                    if (state->logits.rows() != verify_input_ids.size()
+                        || state->logits.columns() != compiled.descriptor.vocabulary_size)
+                    {
+                        return Error{
+                            ErrorCode::InternalError,
+                            "speculative verification produced invalid logits rows"};
+                    }
+                    return {};
                 }
 
-                std::vector<std::vector<float>> logits;
-                logits.reserve(verify_input_ids.size());
-                ActivationBuffer verified_hidden(verify_input_ids.size(),
-                                                 compiled.descriptor.hidden_size);
+                if (logits.size() < draft_count)
+                    logits.resize(draft_count);
+                ActivationBuffer hidden(verify_input_ids.size(),
+                                        compiled.descriptor.hidden_size);
                 for (size_t index = 0;
                      index < verify_input_ids.size();
                      ++index)
@@ -606,25 +611,27 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
                             ErrorCode::InternalError,
                             "sequential MTP verification produced invalid rows"};
                     }
-                    const std::span<const float> values = state->logits.values();
-                    logits.emplace_back(values.begin(), values.end());
                     std::copy_n(state->speculative_main_hidden.row(0),
                                 compiled.descriptor.hidden_size,
-                                verified_hidden.row(index));
+                                hidden.row(index));
+                    // Keep the last row in the Session and retain earlier rows without copying.
+                    if (index < draft_count)
+                        logits[index].swap(state->logits);
                 }
-                state->speculative_main_hidden = std::move(verified_hidden);
+                state->speculative_main_hidden = std::move(hidden);
                 state->speculative_main_hidden_position = token_count;
-                return logits;
+                return {};
             };
-            auto target_logits = execute_target_verify();
-            if (!target_logits)
+            auto verified = forward();
+            if (!verified)
             {
-                auto rolled_back = finish_cache_transaction(state->layers,
-                                                            0);
+                auto rolled_back = finish_cache(state->layers,
+                                                0);
                 if (!rolled_back)
                     return rolled_back.error();
-                return target_logits.error();
+                return verified.error();
             }
+            // Verification rows are consumed before callbacks can reuse state.logits.
             size_t accepted = 0;
             std::vector<float> accepted_probabilities;
             accepted_probabilities.reserve(draft_count);
@@ -634,12 +641,15 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
             {
                 if (opt.sampling.temperature == 0.0f)
                 {
-                    auto target_token = sample_unlocked(target_logits.value()[accepted],
-                                                        opt.sampling);
+                    const std::span<const float> target_row = use_mtp
+                                                                  ? logits[accepted].values()
+                                                                  : std::span<const float>(state->logits.row(accepted),
+                                                                                           state->logits.columns());
+                    auto target_token = sample_unlocked(target_row, opt.sampling);
                     if (!target_token)
                     {
-                        auto rolled_back = finish_cache_transaction(state->layers,
-                                                                    0);
+                        auto rolled_back = finish_cache(state->layers,
+                                                        0);
                         if (!rolled_back)
                             return rolled_back.error();
                         return target_token.error();
@@ -653,7 +663,11 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
                 }
                 else
                 {
-                    auto target_distribution = sampling_distribution_into(target_logits.value()[accepted],
+                    const std::span<const float> target_row = use_mtp
+                                                                  ? logits[accepted].values()
+                                                                  : std::span<const float>(state->logits.row(accepted),
+                                                                                           state->logits.columns());
+                    auto target_distribution = sampling_distribution_into(target_row,
                                                                           opt.sampling,
                                                                           sampling_candidates[0],
                                                                           sampling_token_ids);
@@ -663,8 +677,8 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
                                                                          sampling_token_ids);
                     if (!target_distribution || !draft_distribution)
                     {
-                        auto rolled_back = finish_cache_transaction(state->layers,
-                                                                    0);
+                        auto rolled_back = finish_cache(state->layers,
+                                                        0);
                         if (!rolled_back)
                             return rolled_back.error();
                         return !target_distribution
@@ -678,8 +692,8 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
                                                                           token_id);
                     if (draft_probability <= 0.0f)
                     {
-                        auto rolled_back = finish_cache_transaction(state->layers,
-                                                                    0);
+                        auto rolled_back = finish_cache(state->layers,
+                                                        0);
                         if (!rolled_back)
                             return rolled_back.error();
                         return Error{
@@ -703,10 +717,10 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
                 }
                 ++accepted;
             }
-            if (accepted == 0 && !state_cache_transactions)
+            if (accepted == 0 && !use_mtp)
             {
-                auto rolled_back = finish_cache_transaction(state->layers,
-                                                            0);
+                auto rolled_back = finish_cache(state->layers,
+                                                0);
                 if (!rolled_back)
                     return rolled_back.error();
                 commit_execution(0, 0);
@@ -719,17 +733,22 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
                 {
                     return sample_residual_distribution(rejected_target_distribution,
                                                         rejected_draft_distribution,
-                                                        target_logits.value()[accepted].size(),
+                                                        compiled.descriptor.vocabulary_size,
                                                         sampling_residual,
                                                         random_generator);
                 }
-                return sample_unlocked(target_logits.value()[accepted],
-                                       opt.sampling);
+                const std::span<const float> target_row = use_mtp
+                                                              ? (accepted < draft_count
+                                                                     ? logits[accepted].values()
+                                                                     : state->logits.values())
+                                                              : std::span<const float>(state->logits.row(accepted),
+                                                                                       state->logits.columns());
+                return sample_unlocked(target_row, opt.sampling);
             }();
             if (!next)
             {
-                auto rolled_back = finish_cache_transaction(state->layers,
-                                                            0);
+                auto rolled_back = finish_cache(state->layers,
+                                                0);
                 if (!rolled_back)
                     return rolled_back.error();
                 return next.error();
@@ -755,7 +774,7 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
                 auto callback = emit_token(token, on_token, decode_text, lock);
                 if (!callback)
                 {
-                    auto rolled_back = finish_cache_transaction(state->layers, 0);
+                    auto rolled_back = finish_cache(state->layers, 0);
                     if (!rolled_back)
                         return rolled_back.error();
                     return callback.error();
@@ -782,8 +801,8 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
             }
 
             state->execution_failed = true;
-            auto committed = finish_cache_transaction(state->layers,
-                                                      emitted);
+            auto committed = finish_cache(state->layers,
+                                          emitted);
             if (!committed)
             {
                 return committed.error();
@@ -791,7 +810,7 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
             state->speculative_main_hidden.reset(emitted,
                                                  state->speculative_main_hidden.columns(),
                                                  false);
-            if (state_cache_transactions)
+            if (use_mtp)
             {
                 state->speculative_direct_alignment_ids.resize(emitted);
                 for (size_t index = 0; index < emitted; ++index)
@@ -814,8 +833,8 @@ Result<GenerationResult> Session::generate_speculative(std::vector<float> logits
     catch (...)
     {
         // A thrown callback or allocation must not leave either cache transaction active.
-        auto target = finish_cache_transaction(state->layers, 0);
-        auto draft = finish_cache_transaction(state->speculative_layers, 0);
+        auto target = finish_cache(state->layers, 0);
+        auto draft = finish_cache(state->speculative_layers, 0);
         if (!target)
             return target.error();
         if (!draft)

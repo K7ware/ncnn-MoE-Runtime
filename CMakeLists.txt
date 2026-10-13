@@ -265,6 +265,28 @@ if(NCNN_MOE_USE_NCNN)
     set(NCNN_BUILD_TOOLS OFF CACHE BOOL "Build ncnn tools")
     set(NCNN_VULKAN ${NCNN_MOE_USE_VULKAN} CACHE BOOL "Build ncnn with Vulkan support" FORCE)
     set(NCNN_BF16 ON CACHE BOOL "Build ncnn with bfloat16 support")
+
+    # Fix the bundled Runtime conversion and backend layer closure.
+    set(NCNN_MOE_REQUIRED_LAYERS
+        bias binaryop cast crop dequantize flatten gemm innerproduct interp packing padding
+        permute quantize rmsnorm requantize reshape rotaryembed sdpa scale slice softmax)
+    if(NCNN_MOE_USE_VULKAN)
+        list(APPEND NCNN_MOE_REQUIRED_LAYERS layernorm)
+    endif()
+    file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ncnn/src/CMakeLists.txt"
+        NCNN_MOE_LAYER_DECLARATIONS REGEX [=[^ncnn_add_layer\(]=])
+    foreach(NCNN_MOE_LAYER_DECLARATION IN LISTS NCNN_MOE_LAYER_DECLARATIONS)
+        string(REGEX MATCH [=[^ncnn_add_layer\(([A-Za-z0-9_]+)]=]
+            NCNN_MOE_LAYER_MATCH "${NCNN_MOE_LAYER_DECLARATION}")
+        string(TOLOWER "${CMAKE_MATCH_1}" NCNN_MOE_LAYER_NAME)
+        if(NCNN_MOE_LAYER_NAME IN_LIST NCNN_MOE_REQUIRED_LAYERS)
+            set(WITH_LAYER_${NCNN_MOE_LAYER_NAME} ON CACHE BOOL
+                "build with layer ${NCNN_MOE_LAYER_NAME}" FORCE)
+        else()
+            set(WITH_LAYER_${NCNN_MOE_LAYER_NAME} OFF CACHE BOOL
+                "build with layer ${NCNN_MOE_LAYER_NAME}" FORCE)
+        endif()
+    endforeach()
     add_subdirectory(third_party/ncnn)
     if(TARGET ncnn)
         if(NCNN_OPENMP AND NOT NCNN_SIMPLEOMP AND TARGET OpenMP::OpenMP_CXX
@@ -497,12 +519,6 @@ if(NCNN_MOE_BUILD_TESTS)
     target_link_libraries(ncnn_moe_tokenizer_test PRIVATE ncnn::moe)
     target_include_directories(ncnn_moe_tokenizer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-    if(NCNN_MOE_WITH_VULKAN)
-        add_test(
-            NAME ncnn_moe_pipeline_bind_elision_disabled
-            COMMAND ncnn_moe_tests --disable-vulkan-pipeline-bind-elision
-        )
-    endif()
     add_test(
         NAME ncnn_moe_style
         COMMAND ${CMAKE_COMMAND}

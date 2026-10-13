@@ -63,6 +63,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cfenv>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
@@ -856,19 +857,19 @@ void test_prefill_decode_and_reset()
     }
     std::array<SessionState, 3> layered_states;
     std::array<SessionStatistics, 3> layered_statistics;
+    std::array<std::vector<float>, 3> layered_logits;
     const std::array<DecodeBatchEntry, 3> layered_entries = {{
-        {0, &layered_statistics[0], &layered_states[0], 0},
-        {1, &layered_statistics[1], &layered_states[1], 0},
-        {2, &layered_statistics[2], &layered_states[2], 0},
+        {0, &layered_statistics[0], &layered_states[0], 0, &layered_logits[0]},
+        {1, &layered_statistics[1], &layered_states[1], 0, &layered_logits[1]},
+        {2, &layered_statistics[2], &layered_states[2], 0, &layered_logits[2]},
     }};
     auto layered_staged = forward_decode_batch(layered_model, layered_entries, batch_workspace);
     check(static_cast<bool>(layered_staged));
-    check(layered_staged.value().size() == direct_prompt.size());
     for (size_t row = 0; row < direct_prompt.size(); ++row)
     {
-        check(layered_staged.value()[row].size() == layered_output[row].size());
+        check(layered_logits[row].size() == layered_output[row].size());
         for (size_t column = 0; column < layered_output[row].size(); ++column)
-            check_near(layered_staged.value()[row][column], layered_output[row][column], 1e-5f);
+            check_near(layered_logits[row][column], layered_output[row][column], 1e-5f);
         check(layered_states[row].layers.size() == 2);
         check(!layered_states[row].execution_state.experts_executed);
         check(layered_states[row].expert_scratch.backend_aggregated_output.allocated_bytes() == 0);
@@ -906,22 +907,22 @@ void test_prefill_decode_and_reset()
 
     std::array<SessionState, 2> capture_states;
     std::array<SessionStatistics, 2> capture_statistics;
+    std::array<std::vector<float>, 2> capture_logits;
     capture_states[1].use_speculative_context = false;
     const std::array<DecodeBatchEntry, 2> capture_entries = {{
-        {0, &capture_statistics[0], &capture_states[0], 0},
-        {0, &capture_statistics[1], &capture_states[1], 0},
+        {0, &capture_statistics[0], &capture_states[0], 0, &capture_logits[0]},
+        {0, &capture_statistics[1], &capture_states[1], 0, &capture_logits[1]},
     }};
     auto capture_output = forward_decode_batch(capture_model, capture_entries, batch_workspace);
     check(static_cast<bool>(capture_output));
-    check(capture_output.value().size() == capture_entries.size());
     check(capture_states[0].speculative_main_hidden.rows() == 1);
     check(std::any_of(capture_states[0].speculative_main_hidden.values().begin(),
                       capture_states[0].speculative_main_hidden.values().end(),
                       [](float value) { return value != 0.0f; }));
     check(capture_states[1].speculative_main_hidden.bytes().empty());
-    check(capture_output.value()[0].size() == capture_output.value()[1].size());
-    for (size_t column = 0; column < capture_output.value()[0].size(); ++column)
-        check_near(capture_output.value()[0][column], capture_output.value()[1][column], 1e-5f);
+    check(capture_logits[0].size() == capture_logits[1].size());
+    for (size_t column = 0; column < capture_logits[0].size(); ++column)
+        check_near(capture_logits[0][column], capture_logits[1][column], 1e-5f);
 
     auto session = runtime.create_session(model.value());
     check(static_cast<bool>(session));
@@ -998,10 +999,8 @@ void test_prefill_decode_and_reset()
     check(static_cast<bool>(token_experts_session.value()->statistics().expert_token_counts == std::vector<uint64_t>({1, 1})));
 }
 
-void test_ncnn_linear_operator()
+void test_linear_operator()
 {
-#if NCNN_MOE_WITH_NCNN
-    const VulkanRuntimePtr vulkan_runtime = create_vulkan_runtime();
     TensorData matrix;
     matrix.dtype = DType::Float32;
     matrix.shape = {4, 3};
@@ -1024,14 +1023,6 @@ void test_ncnn_linear_operator()
     bias.shape = {4};
     bias.float32_data = {0.1357f, -0.2468f, 0.3579f, -0.4680f};
 
-    const auto linear = Linear::create(matrix,
-                                       &bias,
-                                       LinearDevice::Cpu,
-                                       automatic_vulkan_device_index,
-                                       vulkan_runtime,
-                                       g_test_optimization_flags);
-    check(static_cast<bool>(linear));
-
     ActivationBuffer input(2, 3);
     input.row(0)[0] = 0.2345f;
     input.row(0)[1] = -1.3456f;
@@ -1039,8 +1030,8 @@ void test_ncnn_linear_operator()
     input.row(1)[0] = -0.5678f;
     input.row(1)[1] = 1.6789f;
     input.row(1)[2] = -2.7891f;
-    ActivationBuffer output;
-    check(static_cast<bool>(linear->forward(input, output)));
+    ActivationBuffer output = forward_linear(matrix, input, g_test_optimization_flags);
+    add_bias_inplace(output, bias);
     check(static_cast<bool>(output.rows() == 2));
     check(static_cast<bool>(output.columns() == 4));
     for (size_t row_index = 0; row_index < input.rows(); ++row_index)
@@ -1057,40 +1048,22 @@ void test_ncnn_linear_operator()
     }
     const ActivationBuffer expected_output = output;
     std::atomic<bool> concurrent_linear_valid{true};
-    std::vector<std::thread> linear_workers;
-    for (uint32_t worker = 0; worker < 4; ++worker)
+    std::array<std::thread, 4> linear_workers;
+    for (std::thread& worker : linear_workers)
     {
-        linear_workers.emplace_back([&]() {
-            for (uint32_t iteration = 0;
-                 iteration < 64;
-                 ++iteration)
+        worker = std::thread([&] {
+            for (uint32_t iteration = 0; iteration < 64; ++iteration)
             {
-                ActivationBuffer concurrent_output;
-                if (!linear->forward(input, concurrent_output)
-                    || concurrent_output.rows()
-                           != expected_output.rows()
-                    || concurrent_output.columns()
-                           != expected_output.columns())
+                ActivationBuffer concurrent_output = forward_linear(matrix, input, g_test_optimization_flags);
+                add_bias_inplace(concurrent_output, bias);
+                for (size_t row = 0; row < concurrent_output.rows(); ++row)
                 {
-                    concurrent_linear_valid.store(false,
-                                                  std::memory_order_relaxed);
-                    return;
-                }
-                for (size_t row = 0;
-                     row < concurrent_output.rows();
-                     ++row)
-                {
-                    for (uint32_t column = 0;
-                         column < concurrent_output.columns();
-                         ++column)
+                    for (uint32_t column = 0; column < concurrent_output.columns(); ++column)
                     {
                         if (!std::isfinite(concurrent_output.row(row)[column])
-                            || std::abs(concurrent_output.row(row)[column]
-                                        - expected_output.row(row)[column])
-                                   > 1e-5f)
+                            || std::abs(concurrent_output.row(row)[column] - expected_output.row(row)[column]) > 1e-5f)
                         {
-                            concurrent_linear_valid.store(false,
-                                                          std::memory_order_relaxed);
+                            concurrent_linear_valid.store(false, std::memory_order_relaxed);
                             return;
                         }
                     }
@@ -1113,57 +1086,29 @@ void test_ncnn_linear_operator()
     for (float value : bias.float32_data)
         bfloat_bias.bfloat16_data.push_back(float_to_bfloat16(value));
 
+    output = forward_linear(bfloat_matrix, input, g_test_optimization_flags);
+    add_bias_inplace(output, bfloat_bias);
+    for (size_t row_index = 0; row_index < input.rows(); ++row_index)
     {
-        const uint64_t direct_bfloat16_flags = g_test_optimization_flags
-                                               & ~OptimizationNcnnCpuBfloat16Linear;
-        check(std::string(Linear::cpu_small_bfloat16_linear_policy(direct_bfloat16_flags))
-              == "moe-direct-bfloat16");
-        check(!Linear::create(bfloat_matrix,
-                              &bfloat_bias,
-                              LinearDevice::Cpu,
-                              automatic_vulkan_device_index,
-                              vulkan_runtime,
-                              direct_bfloat16_flags));
-    }
-    {
-        const uint64_t ncnn_bfloat16_flags = g_test_optimization_flags
-                                             | OptimizationNcnnCpuBfloat16Linear;
-        const bool ncnn_bfloat16_enabled = std::string(Linear::cpu_small_bfloat16_linear_policy(ncnn_bfloat16_flags))
-                                           == "ncnn-fp32-expanded";
-        const auto bfloat_linear = Linear::create(bfloat_matrix,
-                                                  &bfloat_bias,
-                                                  LinearDevice::Cpu,
-                                                  automatic_vulkan_device_index,
-                                                  vulkan_runtime,
-                                                  ncnn_bfloat16_flags);
-        check(static_cast<bool>(bfloat_linear) == ncnn_bfloat16_enabled);
-        if (bfloat_linear)
+        for (uint32_t column = 0; column < output.columns(); ++column)
         {
-            check(static_cast<bool>(bfloat_linear->forward(input, output)));
-            for (size_t row_index = 0; row_index < input.rows(); ++row_index)
+            float expected = bfloat16_to_float(bfloat_bias.bfloat16_data[column]);
+            for (uint32_t input_column = 0; input_column < input.columns(); ++input_column)
             {
-                for (uint32_t column = 0; column < output.columns(); ++column)
-                {
-                    float expected = bfloat16_to_float(bfloat_bias.bfloat16_data[column]);
-                    for (uint32_t input_column = 0;
-                         input_column < input.columns();
-                         ++input_column)
-                    {
-                        expected += bfloat16_to_float(bfloat_matrix.bfloat16_data[column * input.columns()
-                                                                                  + input_column])
-                                    * input.row(row_index)[input_column];
-                    }
-                    check_near(output.row(row_index)[column], expected, 1e-5f);
-                }
+                expected += bfloat16_to_float(bfloat_matrix.bfloat16_data[column * input.columns()
+                                                                          + input_column])
+                            * input.row(row_index)[input_column];
             }
+            check_near(output.row(row_index)[column], expected, 1e-5f);
         }
     }
 
+#if NCNN_MOE_WITH_NCNN && NCNN_MOE_WITH_VULKAN
+    const VulkanRuntimePtr vulkan_runtime = create_vulkan_runtime();
     if (get_gpu_count() > 0)
     {
         const auto vulkan_linear = Linear::create(matrix,
                                                   &bias,
-                                                  LinearDevice::Vulkan,
                                                   automatic_vulkan_device_index,
                                                   vulkan_runtime,
                                                   g_test_optimization_flags);
@@ -1211,13 +1156,11 @@ void test_ncnn_linear_operator()
         }
         const auto chain_operator = Linear::create(chain_matrix,
                                                    nullptr,
-                                                   LinearDevice::Vulkan,
                                                    automatic_vulkan_device_index,
                                                    vulkan_runtime,
                                                    g_test_optimization_flags);
         const auto parallel_operator = Linear::create(parallel_matrix,
                                                       nullptr,
-                                                      LinearDevice::Vulkan,
                                                       automatic_vulkan_device_index,
                                                       vulkan_runtime,
                                                       g_test_optimization_flags);
@@ -1357,7 +1300,7 @@ void test_vulkan_device_tensor_residency()
     const ActivationBuffer expected_first = forward_linear(matrix, input, 0);
     const ActivationBuffer expected_second = forward_linear(matrix, expected_first, 0);
     const VulkanRuntimePtr runtime = create_vulkan_runtime();
-    const auto op = Linear::create(matrix, nullptr, LinearDevice::Vulkan, get_default_gpu_index(), runtime,
+    const auto op = Linear::create(matrix, nullptr, get_default_gpu_index(), runtime,
                                    OptimizationDefaultFlags);
     check(static_cast<bool>(op));
     auto producer = CommandGraph_vulkan::create(*op);
@@ -1383,7 +1326,7 @@ void test_vulkan_device_tensor_residency()
     check(retained.columns() == matrix.shape[0]);
 
     const VulkanRuntimePtr other_runtime = create_vulkan_runtime();
-    const auto other_op = Linear::create(matrix, nullptr, LinearDevice::Vulkan, get_default_gpu_index(), other_runtime,
+    const auto other_op = Linear::create(matrix, nullptr, get_default_gpu_index(), other_runtime,
                                          OptimizationDefaultFlags);
     check(static_cast<bool>(other_op));
     auto other_graph = CommandGraph_vulkan::create(*other_op);
@@ -1650,6 +1593,64 @@ void test_dense_mxn_tiles()
                             * reused_input.row(token)[input_column];
             }
             check_near(reused_output.row(token)[output_column], expected, 1e-4f);
+        }
+    }
+
+    {
+        // N=1025 yields eight full 128-column panels and a one-output tail.
+        constexpr uint32_t M = 33;
+        constexpr uint32_t N = 1025;
+        constexpr uint32_t K = 513;
+        TensorData wide_matrix;
+        wide_matrix.dtype = DType::BFloat16;
+        wide_matrix.shape = {N, K};
+        wide_matrix.bfloat16_data.resize(wide_matrix.element_count());
+        for (uint32_t row = 0; row < N; ++row)
+        {
+            for (uint32_t column = 0; column < K; ++column)
+            {
+                const int value = static_cast<int>((static_cast<uint64_t>(row) * 13
+                                                    + static_cast<uint64_t>(column) * 7)
+                                                   % 9)
+                                  - 4;
+                wide_matrix.bfloat16_data[static_cast<size_t>(row) * K + column] = float_to_bfloat16(static_cast<float>(value) * 0.03125f);
+            }
+        }
+        ActivationBuffer wide_input(M, K);
+        for (uint32_t row = 0; row < M; ++row)
+        {
+            for (uint32_t column = 0; column < K; ++column)
+            {
+                const int value = static_cast<int>((static_cast<uint64_t>(row) * 19
+                                                    + static_cast<uint64_t>(column) * 11)
+                                                   % 129)
+                                  - 64;
+                wide_input.row(row)[column] = static_cast<float>(value) * 0.015317f;
+            }
+        }
+        const std::array<uint32_t, 2> thread_counts = {1, 8};
+        for (uint32_t threads : thread_counts)
+        {
+            CpuOpenMpThreadLimitScope thread_limit;
+            thread_limit.set(threads);
+            const ActivationBuffer wide_output = forward_linear(wide_matrix,
+                                                                wide_input,
+                                                                g_test_optimization_flags);
+            for (uint32_t row = 0; row < M; ++row)
+            {
+                for (uint32_t output_column = 0; output_column < N; ++output_column)
+                {
+                    double expected = 0.0;
+                    const uint16_t* weights = wide_matrix.bfloat16_data.data()
+                                              + static_cast<size_t>(output_column) * K;
+                    for (uint32_t column = 0; column < K; ++column)
+                        expected += static_cast<double>(bfloat16_to_float(weights[column]))
+                                    * static_cast<double>(wide_input.row(row)[column]);
+                    check(std::abs(static_cast<double>(wide_output.row(row)[output_column])
+                                   - expected)
+                          <= 1e-4);
+                }
+            }
         }
     }
 }
@@ -3469,67 +3470,77 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
         }
 
         LayerState mixed_state;
-        mixed_state.normalized.reset(2, 32, false);
-        for (size_t row = 0; row < mixed_state.normalized.rows(); ++row)
-        {
-            for (uint32_t column = 0; column < mixed_state.normalized.columns(); ++column)
-                mixed_state.normalized.row(row)[column] = static_cast<float>(static_cast<int>((row * 13 + column * 5) % 23) - 11) * 0.015625f;
-        }
         mixed_state.resize_experts(2);
-        for (size_t expert_id = 0; expert_id < mixed_state.active_experts().size(); ++expert_id)
-        {
-            ExpertState& active = mixed_state.active_experts()[expert_id];
-            active.batch.expert_id = static_cast<uint32_t>(expert_id);
-            active.batch.routes = {{static_cast<uint32_t>(expert_id), 0, 1.0f}};
-        }
         ExpertScratch mixed_scratch;
         SessionStatistics mixed_statistics;
-        const auto mixed_status = forward_moe(mixed_model,
-                                              mixed_moe,
-                                              mixed_state,
-                                              mixed_statistics,
-                                              mixed_scratch,
-                                              0,
-                                              ExecutionBackend::Cpu,
-                                              true);
-        check(static_cast<bool>(mixed_status));
-        check(mixed_scratch.decode_tasks.size() == mixed_moe.experts.size());
-
-        for (size_t expert_id = 0; expert_id < mixed_moe.experts.size(); ++expert_id)
+        for (size_t pass = 0; pass < 3; ++pass)
         {
-            const ExpertState& active = mixed_state.active_experts()[expert_id];
-            ActivationBuffer input(1, 32);
-            std::copy_n(mixed_state.normalized.row(expert_id), 32, input.row(0));
-            const TensorData& gate_up = mixed_gate_up[expert_id];
-            const TensorData& down = mixed_down[expert_id];
-            ActivationBuffer activated;
-            if (gate_up.dtype == DType::MxFp4)
+            const bool single_input = pass != 1;
+            const size_t route_count = single_input ? 1 : 3;
+            mixed_state.normalized.reset(single_input ? 1 : 2, 32, false);
+            for (size_t row = 0; row < mixed_state.normalized.rows(); ++row)
+                for (uint32_t column = 0; column < mixed_state.normalized.columns(); ++column)
+                    mixed_state.normalized.row(row)[column] = static_cast<float>(static_cast<int>((row * 13 + column * 5 + pass * 7) % 23) - 11) * 0.015625f;
+            mixed_state.reset();
+            for (size_t expert_id = 0; expert_id < mixed_moe.experts.size(); ++expert_id)
             {
-                forward_gate_up_mxfp4(gate_up,
-                                      nullptr,
-                                      input,
-                                      ExpertActivation::Silu,
-                                      0.0f,
-                                      activated,
-                                      mixed_model.opt.optimization_flags);
+                ExpertState& active = mixed_state.active_experts()[expert_id];
+                active.batch.expert_id = static_cast<uint32_t>(expert_id);
+                const uint32_t token_index = single_input ? 0 : static_cast<uint32_t>(expert_id);
+                active.batch.routes.assign(route_count, {token_index, 0, 1.0f});
             }
-            else
+            const auto mixed_status = forward_moe(mixed_model,
+                                                  mixed_moe,
+                                                  mixed_state,
+                                                  mixed_statistics,
+                                                  mixed_scratch,
+                                                  0,
+                                                  ExecutionBackend::Cpu,
+                                                  true);
+            check(static_cast<bool>(mixed_status));
+            check(mixed_scratch.decode_tasks.size() == mixed_moe.experts.size());
+
+            for (size_t expert_id = 0; expert_id < mixed_moe.experts.size(); ++expert_id)
             {
-                const ActivationBuffer projected = forward_linear(gate_up,
-                                                                  input,
-                                                                  mixed_model.opt.optimization_flags);
-                activated.reset(1, 32, false);
-                for (uint32_t column = 0; column < 32; ++column)
-                    activated.row(0)[column] = scaled_silu(projected.row(0)[column], 1.0f, mixed_model.opt.optimization_flags)
-                                               * projected.row(0)[32 + column];
+                const ExpertState& active = mixed_state.active_experts()[expert_id];
+                const ActivationBuffer* task_input = mixed_scratch.decode_tasks[expert_id].input;
+                check(task_input == (single_input ? &mixed_state.normalized : &active.input));
+                check(active.input.rows() == (single_input ? 0 : route_count));
+                ActivationBuffer input(route_count, 32);
+                for (size_t row = 0; row < route_count; ++row)
+                    std::copy_n(mixed_state.normalized.row(active.batch.routes[row].token_index), 32, input.row(row));
+                const TensorData& gate_up = mixed_gate_up[expert_id];
+                const TensorData& down = mixed_down[expert_id];
+                ActivationBuffer activated;
+                if (gate_up.dtype == DType::MxFp4)
+                {
+                    forward_gate_up_mxfp4(gate_up,
+                                          nullptr,
+                                          input,
+                                          ExpertActivation::Silu,
+                                          0.0f,
+                                          activated,
+                                          mixed_model.opt.optimization_flags);
+                }
+                else
+                {
+                    const ActivationBuffer projected = forward_linear(gate_up,
+                                                                      input,
+                                                                      mixed_model.opt.optimization_flags);
+                    activated.reset(route_count, 32, false);
+                    for (size_t row = 0; row < route_count; ++row)
+                        for (uint32_t column = 0; column < 32; ++column)
+                            activated.row(row)[column] = scaled_silu(projected.row(row)[column], 1.0f, mixed_model.opt.optimization_flags)
+                                                         * projected.row(row)[32 + column];
+                }
+                const ActivationBuffer expected = forward_linear(down,
+                                                                 activated,
+                                                                 mixed_model.opt.optimization_flags);
+                check(active.output.rows() == expected.rows());
+                check(active.output.columns() == expected.columns());
+                for (size_t index = 0; index < expected.values().size(); ++index)
+                    check_near(active.output.values()[index], expected.values()[index], 1e-5f);
             }
-            const ActivationBuffer expected = forward_linear(down,
-                                                             activated,
-                                                             mixed_model.opt.optimization_flags);
-            check(active.output.rows() == expected.rows());
-            check(active.output.columns() == expected.columns());
-            for (size_t index = 0; index < expected.values().size(); ++index)
-                check_near(active.output.values()[index], expected.values()[index], 1e-5f);
         }
     }
 
@@ -3696,22 +3707,38 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
     if (get_gpu_count() > 0)
     {
         check(static_cast<bool>(expert_backend));
+        for (size_t aggregation_case = 0; aggregation_case < 2; ++aggregation_case)
         {
-            // This fixture specifically covers the nonresident CPU block path.
-            // GPU-first admission has independent cold-prefill coverage.
+            const bool aggregate_routes = aggregation_case != 0;
+            // This fixture covers whole-Expert CPU fallback with priority disabled.
+            // The second mode also covers mixed residency and full aggregation.
             CompiledModel model;
             model.descriptor.hidden_size = expert_down.shape[0];
             model.opt.hybrid_mode = HybridMode::HybridExperts;
             model.opt.optimization_flags = g_test_optimization_flags
                                            & ~OptimizationCpuMxfp4Q8
                                            & ~OptimizationVulkanExpertGpuPriority;
-            model.expert_backend = expert_backend;
+            if (aggregate_routes)
+                model.opt.optimization_flags |= OptimizationVulkanRouteAggregation;
+            else
+                model.opt.optimization_flags &= ~OptimizationVulkanRouteAggregation;
+            uint64_t block_optimization_flags = backend_optimization_flags;
+            if (!aggregate_routes)
+                block_optimization_flags &= ~OptimizationVulkanRouteAggregation;
+            auto block_backend = create_vulkan_expert_backend(4096,
+                                                              automatic_vulkan_device_index,
+                                                              nullptr,
+                                                              vulkan_runtime,
+                                                              block_optimization_flags);
+            check(static_cast<bool>(block_backend));
+            model.expert_backend = block_backend;
             auto gate_up = model.weights.add("block_gate_up", expert_gate_up);
             auto down = model.weights.add("block_down", expert_down);
             auto gate_bias = model.weights.add("block_gate_bias", expert_gate_up_bias);
             auto down_bias = model.weights.add("block_down_bias", expert_down_bias);
             check(gate_up && down && gate_bias && down_bias);
             model.operators.bind_weight_count(model.weights.size());
+            check(model.expert_cache == nullptr);
             MoeBlockPlan moe;
             moe.experts.resize(2);
             for (size_t index = 0; index < moe.experts.size(); ++index)
@@ -3726,12 +3753,25 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                 expert.cache_key = "nonresident-block-" + std::to_string(index);
             }
             LayerState state;
-            state.normalized.reset(96, expert_gate_up.shape[1], false);
             state.resize_experts(2);
+            std::array<const float*, 2> active_output_storage = {};
+            std::array<uint64_t, 2> active_output_capacity = {};
+            for (size_t index = 0; index < state.active_experts().size(); ++index)
+            {
+                ActivationBuffer& output = state.active_experts()[index].output;
+                output.reset(65, expert_down.shape[0], false);
+                active_output_storage[index] = output.values().data();
+                active_output_capacity[index] = output.allocated_bytes();
+            }
             ExpertScratch scratch;
             SessionStatistics statistics;
+            const auto block_gate_owner = std::make_shared<const TensorData>(expert_gate_up);
+            const auto block_down_owner = std::make_shared<const TensorData>(expert_down);
             for (size_t pass = 0; pass < 3; ++pass)
             {
+                state.normalized.reset(aggregate_routes ? (pass == 1 ? 64 : 32) : 96,
+                                       expert_gate_up.shape[1],
+                                       false);
                 for (size_t row = 0; row < state.normalized.rows(); ++row)
                     for (uint32_t column = 0; column < state.normalized.columns(); ++column)
                         state.normalized.row(row)[column] = static_cast<float>(static_cast<int>((row + column + pass) % 17) - 8) * 0.015625f;
@@ -3739,16 +3779,59 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                 {
                     ExpertState& active = state.active_experts()[index];
                     active.batch.expert_id = static_cast<uint32_t>(index);
-                    const size_t count = index == 0 ? (pass == 1 ? 32 : 65) : (pass == 1 ? 8 : 16);
+                    const size_t count = index == 0
+                                             ? (pass == 1 ? 65 : 32)
+                                             : (pass == 1 ? 16 : 8);
                     active.batch.routes.resize(count);
                     for (size_t row = 0; row < count; ++row)
-                        active.batch.routes[row] = {static_cast<uint32_t>(index == 0 ? row : row * (pass == 1 ? 3 : 5)), 0, 1.0f};
+                    {
+                        const size_t token_count = state.normalized.rows();
+                        size_t token_index = row;
+                        if (index == 0 && aggregate_routes)
+                        {
+                            token_index = pass == 1 ? std::min(row, token_count - 1)
+                                                    : row % (token_count - 1);
+                        }
+                        else if (index != 0)
+                        {
+                            token_index = row * (aggregate_routes || pass == 1 ? 3 : 5);
+                        }
+                        check(token_index < token_count);
+                        active.batch.routes[row] = {static_cast<uint32_t>(token_index), 0, 1.0f};
+                    }
                 }
+                ActivationBuffer expected_aggregated(state.normalized.rows(), expert_down.shape[0]);
+                const uint64_t executions_before = block_backend->statistics().executions;
+                const uint64_t aggregations_before = block_backend->statistics().route_aggregation_batches;
                 auto ret = forward_moe(model, moe, state, statistics, scratch, 0, ExecutionBackend::Vulkan, false);
                 check(static_cast<bool>(ret));
-                check(!scratch.backend_aggregated_output_valid);
-                for (const ExpertState& active : state.active_experts())
+                const bool expect_aggregated = aggregate_routes && pass == 2;
+                check(block_backend->statistics().route_aggregation_batches
+                      == aggregations_before + (expect_aggregated ? 1 : 0));
+                check(scratch.backend_aggregated_output_valid == expect_aggregated);
+                check(scratch.backend_aggregated.size() == state.active_experts().size());
+                if (expect_aggregated)
                 {
+                    check(scratch.backend_aggregated[0] == 1);
+                    check(scratch.backend_aggregated[1] == 1);
+                }
+                else
+                {
+                    check(scratch.backend_aggregated[0] == 0);
+                    check(scratch.backend_aggregated[1] == 0);
+                }
+                const bool gpu_executed = block_backend->statistics().executions > executions_before;
+                if (pass == 0)
+                    check(!gpu_executed);
+                else
+                    check(gpu_executed);
+                const float tolerance = gpu_executed ? 1e-3f : 1e-5f;
+                for (size_t index = 0; index < state.active_experts().size(); ++index)
+                {
+                    const ExpertState& active = state.active_experts()[index];
+                    if (pass == 0)
+                        check(active.output.values().data() == active_output_storage[index]
+                              && active.output.allocated_bytes() == active_output_capacity[index]);
                     ActivationBuffer input(active.batch.routes.size(), state.normalized.columns());
                     for (size_t row = 0; row < input.rows(); ++row)
                         std::copy_n(state.normalized.row(active.batch.routes[row].token_index), input.columns(), input.row(row));
@@ -3760,13 +3843,63 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
                                           expert_activation_limit,
                                           activated,
                                           model.opt.optimization_flags);
-                    const ActivationBuffer expected = forward_linear(expert_down, expert_down_bias, activated, model.opt.optimization_flags);
-                    check(active.output.rows() == input.rows());
-                    check(active.output.columns() == expected.columns());
-                    for (size_t value = 0; value < expected.values().size(); ++value)
-                        check_near(active.output.values()[value], expected.values()[value], 1e-5f);
+                    const ActivationBuffer expected = forward_linear(expert_down,
+                                                                     expert_down_bias,
+                                                                     activated,
+                                                                     model.opt.optimization_flags);
+                    if (!expect_aggregated)
+                    {
+                        check(active.output.rows() == input.rows());
+                        check(active.output.columns() == expected.columns());
+                        for (size_t value = 0; value < expected.values().size(); ++value)
+                            check_near(active.output.values()[value], expected.values()[value], tolerance);
+                    }
+                    for (size_t row = 0; row < active.batch.routes.size(); ++row)
+                    {
+                        float* aggregate_row = expected_aggregated.row(active.batch.routes[row].token_index);
+                        const float* expected_row = expected.row(row);
+                        for (uint32_t column = 0; column < expected.columns(); ++column)
+                            aggregate_row[column] += expected_row[column] * active.batch.routes[row].weight;
+                    }
+                }
+                if (expect_aggregated)
+                {
+                    check(scratch.backend_aggregated_output.rows() == expected_aggregated.rows());
+                    check(scratch.backend_aggregated_output.columns() == expected_aggregated.columns());
+                    for (size_t value = 0; value < expected_aggregated.values().size(); ++value)
+                        check_near(scratch.backend_aggregated_output.values()[value],
+                                   expected_aggregated.values()[value],
+                                   1e-3f);
+                    for (uint32_t column = 0; column < expected_aggregated.columns(); ++column)
+                        check_near(scratch.backend_aggregated_output.row(31)[column], 0.0f, 1e-6f);
                 }
                 state.reset();
+                if (pass == 0)
+                {
+                    const size_t admitted_experts = aggregate_routes ? 1 : moe.experts.size();
+                    for (size_t index = 0; index < admitted_experts; ++index)
+                        block_backend->admit("nonresident-block-" + std::to_string(index),
+                                             block_gate_owner,
+                                             &expert_gate_up_bias,
+                                             block_down_owner,
+                                             &expert_down_bias,
+                                             0,
+                                             expert_activation_limit,
+                                             ExpertActivation::GptOssSwiGlu);
+                    block_backend->wait_for_background_work();
+                }
+                else if (aggregate_routes && pass == 1)
+                {
+                    block_backend->admit("nonresident-block-1",
+                                         block_gate_owner,
+                                         &expert_gate_up_bias,
+                                         block_down_owner,
+                                         &expert_down_bias,
+                                         0,
+                                         expert_activation_limit,
+                                         ExpertActivation::GptOssSwiGlu);
+                    block_backend->wait_for_background_work();
+                }
             }
         }
         const auto backend_gate_up = std::make_shared<TensorData>(expert_gate_up);
@@ -4258,6 +4391,82 @@ void test_mxfp4_cpu_kernel_and_fused_gate_up()
 
 void test_qnk_cpu_kernel()
 {
+    // Q8_K keeps the first signed maximum and honors the caller's rounding mode.
+    // Unaligned blocks also verify the encoded per-16-value sums.
+    const int rounding = std::fegetround();
+    std::array<float, qnk_block_elements * 2 + 1> q8_input{};
+    std::array<uint8_t, 292 * 2 + 1> q8_encoded{};
+    for (int mode : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO})
+    {
+        check(std::fesetround(mode) == 0);
+        for (int sign : {-1, 1})
+        {
+            for (size_t index = 1; index < q8_input.size(); ++index)
+                q8_input[index] = static_cast<float>(static_cast<int>(index % 17) - 8) * 0.25f;
+            for (size_t block = 0; block < 2; ++block)
+            {
+                q8_input[1 + block * qnk_block_elements + 7] = 127.0f * sign;
+                q8_input[1 + block * qnk_block_elements + 13] = -127.0f * sign;
+            }
+            qnk_q8k_quantize(q8_input.data() + 1, q8_encoded.data() + 1, qnk_block_elements * 2);
+            for (size_t block = 0; block < 2; ++block)
+            {
+                const uint8_t* encoded = q8_encoded.data() + 1 + block * 292;
+                float scale = 0.0f;
+                std::memcpy(&scale, encoded, sizeof(scale));
+                check(scale == static_cast<float>(-sign));
+                for (size_t group = 0; group < 16; ++group)
+                {
+                    int16_t sum = 0;
+                    for (size_t lane = 0; lane < 16; ++lane)
+                    {
+                        const size_t index = group * 16 + lane;
+                        const int8_t value = static_cast<int8_t>(std::lrintf(-sign * q8_input[1 + block * qnk_block_elements + index]));
+                        check(static_cast<int8_t>(encoded[4 + index]) == value);
+                        sum = static_cast<int16_t>(sum + value);
+                    }
+                    int16_t actual = 0;
+                    std::memcpy(&actual, encoded + 260 + group * sizeof(actual), sizeof(actual));
+                    check(actual == sum);
+                }
+            }
+        }
+    }
+    check(std::fesetround(rounding) == 0);
+    q8_input.fill(-0.0f);
+    q8_encoded.fill(0xff);
+    qnk_q8k_quantize(q8_input.data() + 1, q8_encoded.data() + 1, qnk_block_elements * 2);
+    check(q8_encoded[0] == 0xff);
+    check(std::all_of(q8_encoded.begin() + 1, q8_encoded.end(), [](uint8_t value) { return value == 0; }));
+
+    // Each Q6_K scale covers 16 values, including the second half of each
+    // 32-value lane group. Keep this oracle independent of the kernel decoder.
+    std::array<uint8_t, 210> q6{};
+    std::fill_n(q6.data(), 128, uint8_t{0x11});
+    std::fill_n(q6.data() + 128, 64, uint8_t{0xaa});
+    for (uint32_t group = 0; group < 16; ++group)
+        q6[192 + group] = static_cast<uint8_t>(static_cast<int>(group + 1) * (group & 1u ? -1 : 1));
+    const std::array<uint16_t, 4> half_scales = {0x3c00, 0x0001, 0x8001, 0x0000};
+    const std::array<float, 4> scales = {1.0f, 0x1p-24f, -0x1p-24f, 0.0f};
+    for (size_t index = 0; index < half_scales.size(); ++index)
+    {
+        std::memcpy(q6.data() + 208, &half_scales[index], sizeof(uint16_t));
+        std::array<float, qnk_block_elements> decoded{};
+        std::array<float, qnk_block_elements> values{};
+        qnk_dequantize_block(DType::Q6K, q6.data(), decoded.data());
+        float expected = 0.0f;
+        for (uint32_t column = 0; column < qnk_block_elements; ++column)
+        {
+            const uint32_t group = column / 16;
+            const float weight = scales[index] * static_cast<float>(static_cast<int>(group + 1) * (group & 1u ? -1 : 1));
+            check(decoded[column] == weight);
+            values[column] = static_cast<float>(static_cast<int>(column % 13) - 6) * 0.03125f;
+            expected += weight * values[column];
+        }
+        check_near(qnk_dot_block(DType::Q6K, q6.data(), values.data()), expected,
+                   2e-6f * std::max(std::fabs(expected), 0x1p-24f));
+    }
+
     constexpr uint32_t columns = 512;
     constexpr size_t rows = 9;
     constexpr size_t input_rows = 3;
@@ -4465,6 +4674,13 @@ void test_qnk_cpu_kernel()
                 {
                     const uint8_t* encoded = raw.data() + (row * block_count + block) * block_bytes;
                     qnk_dequantize_block(dtype, encoded, decoded);
+#if defined(__aarch64__) || defined(_M_ARM64)
+                    // Fused unpacking must preserve the FP32 dot accumulation order.
+                    const float* values = input.row(token) + block * qnk_block_elements;
+                    const float dot = qnk_dot_block(dtype, encoded, values);
+                    const float reference_dot = float_dot(decoded, values, qnk_block_elements);
+                    check(std::bit_cast<uint32_t>(dot) == std::bit_cast<uint32_t>(reference_dot));
+#endif
                     for (uint32_t column = 0; column < qnk_block_elements; ++column)
                         expected += decoded[column] * input.row(token)[block * qnk_block_elements + column];
                 }
@@ -4472,6 +4688,61 @@ void test_qnk_cpu_kernel()
                 check_near(packed_projected.row(token)[row], expected, 0.1f);
                 check_near(packed_projected.row(token)[row], projected.row(token)[row], 0.1f);
                 check_near(owner_packed_projected.row(token)[row], packed_projected.row(token)[row], 0.1f);
+            }
+        }
+
+        // Exercise decode, complete GEMM tiles and token/output tails with
+        // reused output storage. The wider case also fills an OpenMP team.
+        CpuOpenMpThreadLimitScope thread_limit;
+        for (uint32_t threads : {1u, 2u, 8u})
+        {
+            thread_limit.set(threads);
+            for (size_t tokens : {0u, 1u, 4u, 5u, 65u, 1u})
+            {
+                TensorData tiled = matrix;
+                const uint32_t outputs = tokens == 65 ? 257u : static_cast<uint32_t>(rows);
+                tiled.shape[0] = outputs;
+                const size_t row_bytes = block_count * block_bytes;
+                tiled.quantized_data.resize(static_cast<size_t>(outputs) * row_bytes);
+                for (uint32_t row = 0; row < outputs; ++row)
+                    std::copy_n(raw.data() + (row % rows) * row_bytes,
+                                row_bytes, tiled.quantized_data.data() + static_cast<size_t>(row) * row_bytes);
+                ActivationBuffer values(tokens, columns);
+                for (size_t token = 0; token < tokens; ++token)
+                    for (uint32_t column = 0; column < columns; ++column)
+                        values.row(token)[column] = static_cast<float>(static_cast<int>((column * 7 + token * 3) % 29) - 14) * 0.015625f;
+                CompiledOperator owner;
+                for (uint64_t flags : {uint64_t{0}, uint64_t{OptimizationCpuPackedWeights}})
+                {
+#if defined(_OPENMP)
+                    if (threads == 2 && tokens == 65)
+                    {
+#pragma omp parallel num_threads(2)
+                        {
+#pragma omp single
+                            forward_linear(tiled, values, projected, flags, &owner, ExecutionBackend::Cpu);
+                        }
+                    }
+                    else
+#endif
+                        forward_linear(tiled, values, projected, flags, &owner, ExecutionBackend::Cpu);
+                    check(projected.rows() == tokens && projected.columns() == outputs);
+                    for (uint32_t row = 0; row < outputs; ++row)
+                    {
+                        std::array<float, columns> reference{};
+                        for (uint32_t block = 0; block < block_count; ++block)
+                            qnk_dequantize_block(dtype, raw.data() + ((row % rows) * block_count + block) * block_bytes,
+                                                 reference.data() + block * qnk_block_elements);
+                        for (size_t token = 0; token < tokens; ++token)
+                        {
+                            double expected = 0.0;
+                            for (uint32_t column = 0; column < columns; ++column)
+                                expected += static_cast<double>(reference[column]) * values.row(token)[column];
+                            check_near(projected.row(token)[row], static_cast<float>(expected),
+                                       3e-5f * std::max(1.0f, std::fabs(static_cast<float>(expected))));
+                        }
+                    }
+                }
             }
         }
     }
@@ -4545,7 +4816,7 @@ void test_qnk_graph_gate_up_fusion()
 
         CompilerOption compiler_opt;
         compiler_opt.flags |= BackendVulkanDense;
-        compiler_opt.optimization_flags = OptimizationDefaultFlags & ~OptimizationNcnnCpuBfloat16Linear;
+        compiler_opt.optimization_flags = OptimizationDefaultFlags;
         compiler_opt.num_concurrent_sessions = 3;
         CompiledModel model;
         auto ret = compile_model(std::move(descriptor), std::move(mapping), model, HybridMode::CpuOnly, compiler_opt);
@@ -5938,8 +6209,6 @@ void test_file_backed_bfloat16_expert_cache()
     ExpertCache mapped_cache(pair_size, 0, {}, ExpertIoMode::Mmap);
     auto mapped = mapped_cache.acquire_pair(gate_up, down);
     check(static_cast<bool>(mapped));
-    check(!mapped.value().cache_hit);
-    check(mapped.value().bytes_read == pair_size);
     check(static_cast<bool>(mapped.value().gate_up->mapped_data));
     check(mapped.value().gate_up->bfloat16_data.empty());
     check_near(bfloat16_to_float(mapped.value().gate_up->bfloat16_values()[2]),
@@ -5948,11 +6217,10 @@ void test_file_backed_bfloat16_expert_cache()
     check(mapped_cache.is_ready(gate_up, down, key));
     auto hit = mapped_cache.acquire_pair(gate_up, down, std::numeric_limits<uint32_t>::max(), key);
     check(static_cast<bool>(hit));
-    check(hit.value().cache_hit);
-    check(hit.value().bytes_read == 0);
     const ExpertCacheStatistics mapped_statistics = mapped_cache.statistics();
     check(mapped_statistics.misses == 1);
     check(mapped_statistics.hits == 1);
+    check(mapped_statistics.bytes_read == pair_size);
     check(mapped_statistics.resident_size == pair_size);
     check(mapped_statistics.mapped_ranges == 2);
     check(mapped_statistics.mapped_bytes == pair_size);
@@ -6142,8 +6410,6 @@ void test_file_backed_mxfp4_expert_cache()
     {
         auto first = cache.acquire_pair(gate_zero, down_zero);
         check(static_cast<bool>(first));
-        check(static_cast<bool>(!first.value().cache_hit));
-        check(static_cast<bool>(first.value().bytes_read == 34));
         check(static_cast<bool>(first.value().gate_up->mxfp4_blocks.front() == 0));
         check(static_cast<bool>(first.value().down->mxfp4_blocks.front() == 16));
         check(static_cast<bool>(first.value().gate_up->mxfp4_scales.front() == 101));
@@ -6158,8 +6424,6 @@ void test_file_backed_mxfp4_expert_cache()
         check(cache.is_ready(gate_zero, down_zero, prepared_key));
         auto hit = cache.acquire_pair(gate_zero, down_zero, std::numeric_limits<uint32_t>::max(), prepared_key);
         check(static_cast<bool>(hit));
-        check(static_cast<bool>(hit.value().cache_hit));
-        check(static_cast<bool>(hit.value().bytes_read == 0));
         check(static_cast<bool>(hit.value().gate_up_operator == first_gate_up_operator));
         check(static_cast<bool>(hit.value().down_operator == first_down_operator));
     }
@@ -6175,8 +6439,6 @@ void test_file_backed_mxfp4_expert_cache()
         auto acquired = cache.try_acquire_ready_pairs(requests, leases);
         check(static_cast<bool>(acquired));
         check(static_cast<bool>(acquired.value()));
-        check(static_cast<bool>(leases[0].cache_hit));
-        check(static_cast<bool>(leases[0].bytes_read == 0));
         check(static_cast<bool>(leases[0].gate_up->mxfp4_blocks.front() == 0));
         check(static_cast<bool>(leases[0].gate_up_operator == first_gate_up_operator));
         check(static_cast<bool>(leases[0].down_operator == first_down_operator));
@@ -6184,7 +6446,6 @@ void test_file_backed_mxfp4_expert_cache()
     {
         auto second = cache.acquire_pair(gate_one, down_one);
         check(static_cast<bool>(second));
-        check(static_cast<bool>(!second.value().cache_hit));
         check(static_cast<bool>(second.value().gate_up->mxfp4_blocks.front() == 32));
         check(static_cast<bool>(second.value().down->mxfp4_scales.front() == 104));
     }
@@ -6670,7 +6931,6 @@ void test_file_backed_mxfp4_expert_cache()
     {
         auto restored = tiered.acquire_pair(gate_zero, down_zero);
         check(static_cast<bool>(restored));
-        check(static_cast<bool>(!restored.value().cache_hit));
         check(static_cast<bool>(restored.value().gate_up->mxfp4_blocks.front() == 0));
         check(static_cast<bool>(restored.value().down->mxfp4_scales.front() == 102));
     }
@@ -6761,7 +7021,7 @@ void test_file_backed_mxfp4_expert_cache()
         gpu_one.reset();
         const uint64_t reads_before = joint.statistics().bytes_read;
         auto restored = joint.acquire_pair(gate_one, down_one, 0, "joint-one");
-        check(restored && !restored.value().cache_hit);
+        check(static_cast<bool>(restored));
         check(restored.value().gate_up->mxfp4_blocks.front() == 32);
         check(restored.value().down->mxfp4_scales.front() == 104);
         check(joint.statistics().bytes_read == reads_before + 34);
@@ -6911,23 +7171,36 @@ void test_file_backed_mxfp4_expert_cache()
     check(static_cast<bool>(concurrent.request_pair(gate_zero, down_zero)));
     bool first_ok = false;
     bool second_ok = false;
-    bool first_hit = false;
-    bool second_hit = false;
+    std::shared_ptr<const TensorData> first_gate_up;
+    std::shared_ptr<const TensorData> first_down;
+    std::shared_ptr<const TensorData> second_gate_up;
+    std::shared_ptr<const TensorData> second_down;
     std::thread first_waiter([&] {
         auto lease = concurrent.acquire_pair(gate_zero, down_zero);
         first_ok = static_cast<bool>(lease);
-        first_hit = lease && lease.value().cache_hit;
+        if (lease)
+        {
+            first_gate_up = lease.value().gate_up;
+            first_down = lease.value().down;
+        }
     });
     std::thread second_waiter([&] {
         auto lease = concurrent.acquire_pair(gate_zero, down_zero);
         second_ok = static_cast<bool>(lease);
-        second_hit = lease && lease.value().cache_hit;
+        if (lease)
+        {
+            second_gate_up = lease.value().gate_up;
+            second_down = lease.value().down;
+        }
     });
     first_waiter.join();
     second_waiter.join();
     check(static_cast<bool>(first_ok));
     check(static_cast<bool>(second_ok));
-    check(static_cast<bool>(first_hit != second_hit));
+    check(first_gate_up && first_down);
+    check(second_gate_up && second_down);
+    check(first_gate_up == second_gate_up);
+    check(first_down == second_down);
     check(static_cast<bool>(concurrent.statistics().misses == 1));
     check(static_cast<bool>(concurrent.statistics().hits == 1));
     check(static_cast<bool>(concurrent.statistics().queued_reads == 1));
@@ -7084,10 +7357,12 @@ void test_file_backed_mxfp4_expert_cache()
         auto first = adaptive_replacement.acquire_pair(gate_zero, down_zero);
         check(static_cast<bool>(first));
     }
+    check(adaptive_replacement.statistics().misses == 1);
     {
         auto reused = adaptive_replacement.acquire_pair(gate_zero, down_zero);
-        check(static_cast<bool>(reused && reused.value().cache_hit));
+        check(static_cast<bool>(reused));
     }
+    check(adaptive_replacement.statistics().hits == 1);
     {
         auto single_use = adaptive_replacement.acquire_pair(gate_one, down_one);
         check(static_cast<bool>(single_use));
@@ -7096,10 +7371,12 @@ void test_file_backed_mxfp4_expert_cache()
         auto third = adaptive_replacement.acquire_pair(gate_zero, down_one);
         check(static_cast<bool>(third));
     }
+    const uint64_t hits_before_retained = adaptive_replacement.statistics().hits;
     {
         auto retained_hot = adaptive_replacement.acquire_pair(gate_zero, down_zero);
-        check(static_cast<bool>(retained_hot && retained_hot.value().cache_hit));
+        check(static_cast<bool>(retained_hot));
     }
+    check(adaptive_replacement.statistics().hits == hits_before_retained + 1);
     {
         auto recent_ghost = adaptive_replacement.acquire_pair(gate_one, down_one);
         check(static_cast<bool>(recent_ghost));
@@ -7147,14 +7424,13 @@ void test_file_backed_mxfp4_expert_cache()
     {
         auto small = variable_size.acquire_pair(small_gate, small_down);
         check(static_cast<bool>(small));
-        check(static_cast<bool>(small.value().bytes_read == 18));
     }
     {
         auto regular = variable_size.acquire_pair(gate_one, down_one);
         check(static_cast<bool>(regular));
-        check(static_cast<bool>(regular.value().bytes_read == 34));
     }
     const ExpertCacheStatistics variable_statistics = variable_size.statistics();
+    check(static_cast<bool>(variable_statistics.bytes_read == 52));
     check(static_cast<bool>(variable_statistics.resident_size == 52));
     check(static_cast<bool>(variable_statistics.arc_recent_size + variable_statistics.arc_frequent_size == variable_statistics.resident_size));
 
@@ -7218,7 +7494,6 @@ void test_file_backed_mxfp4_expert_cache()
     ExpertCache large_reads(large_pair_bytes, 2, {}, ExpertIoMode::Mmap);
     auto large_pair = large_reads.acquire_pair(large_gate, large_down);
     check(static_cast<bool>(large_pair));
-    check(static_cast<bool>(large_pair.value().bytes_read == large_pair_bytes));
     check(static_cast<bool>(large_reads.statistics().mapped_ranges == 4));
     check(static_cast<bool>(large_reads.statistics().mapped_bytes == large_pair_bytes));
     check(static_cast<bool>(large_pair.value().gate_up->mxfp4_blocks.front() == 0));
@@ -7402,14 +7677,14 @@ void test_cross_session_batch_scheduler()
     const CompiledModel& compiled = model_compiled(*model.value());
     std::array<SessionState, 3> mixed_states;
     std::array<SessionStatistics, 3> mixed_statistics;
+    std::array<std::vector<float>, 3> mixed_logits;
     const std::array<DecodeBatchEntry, 3> mixed_entries = {{
-        {0, &mixed_statistics[0], &mixed_states[0], 0, true},
-        {1, &mixed_statistics[1], &mixed_states[1], 0, false},
-        {2, &mixed_statistics[2], &mixed_states[2], 0, true},
+        {0, &mixed_statistics[0], &mixed_states[0], 0, &mixed_logits[0]},
+        {1, &mixed_statistics[1], &mixed_states[1], 0},
+        {2, &mixed_statistics[2], &mixed_states[2], 0, &mixed_logits[2]},
     }};
-    auto mixed_logits = forward_decode_batch(compiled, mixed_entries, batch_workspace);
-    check(static_cast<bool>(mixed_logits));
-    check(mixed_logits.value().size() == mixed_entries.size());
+    auto mixed_status = forward_decode_batch(compiled, mixed_entries, batch_workspace);
+    check(static_cast<bool>(mixed_status));
 
     std::array<const std::byte*, 3> normalized_data;
     std::array<const std::byte*, 3> router_data;
@@ -7426,9 +7701,8 @@ void test_cross_session_batch_scheduler()
         std::fill_n(layer.router_logits.row(0), layer.router_logits.values().size(),
                     std::numeric_limits<float>::quiet_NaN());
     }
-    mixed_logits = forward_decode_batch(compiled, mixed_entries, batch_workspace);
-    check(static_cast<bool>(mixed_logits));
-    check(mixed_logits.value().size() == mixed_entries.size());
+    mixed_status = forward_decode_batch(compiled, mixed_entries, batch_workspace);
+    check(static_cast<bool>(mixed_status));
     for (size_t index = 0; index < mixed_states.size(); ++index)
     {
         const LayerState& layer = mixed_states[index].execution_state;
@@ -7438,14 +7712,14 @@ void test_cross_session_batch_scheduler()
 
     std::array<SessionState, 3> all_states;
     std::array<SessionStatistics, 3> all_statistics;
+    std::array<std::vector<float>, 3> all_output_logits;
     const std::array<DecodeBatchEntry, 3> all_entries = {{
-        {0, &all_statistics[0], &all_states[0], 0},
-        {1, &all_statistics[1], &all_states[1], 0},
-        {2, &all_statistics[2], &all_states[2], 0},
+        {0, &all_statistics[0], &all_states[0], 0, &all_output_logits[0]},
+        {1, &all_statistics[1], &all_states[1], 0, &all_output_logits[1]},
+        {2, &all_statistics[2], &all_states[2], 0, &all_output_logits[2]},
     }};
-    auto all_logits = forward_decode_batch(compiled, all_entries, batch_workspace);
-    check(static_cast<bool>(all_logits));
-    check(all_logits.value().size() == all_entries.size());
+    auto all_status = forward_decode_batch(compiled, all_entries, batch_workspace);
+    check(static_cast<bool>(all_status));
     for (size_t index = 0; index < mixed_entries.size(); ++index)
     {
         check(mixed_states[index].hidden.rows() == all_states[index].hidden.rows());
@@ -7459,14 +7733,14 @@ void test_cross_session_batch_scheduler()
                            1e-5f);
             }
         }
-        if (!mixed_entries[index].output_logits)
+        if (!mixed_entries[index].logits)
         {
-            check(mixed_logits.value()[index].empty());
+            check(mixed_logits[index].empty());
             continue;
         }
-        check(mixed_logits.value()[index].size() == all_logits.value()[index].size());
-        for (size_t column = 0; column < mixed_logits.value()[index].size(); ++column)
-            check_near(mixed_logits.value()[index][column], all_logits.value()[index][column], 1e-5f);
+        check(mixed_logits[index].size() == all_output_logits[index].size());
+        for (size_t column = 0; column < mixed_logits[index].size(); ++column)
+            check_near(mixed_logits[index][column], all_output_logits[index][column], 1e-5f);
     }
 
     auto different_input_first = runtime.create_session(model.value());
@@ -7824,7 +8098,6 @@ void test_staged_bfloat16_dispatch_telemetry()
     TestRuntime runtime;
     Option opt;
     opt.hybrid_mode = HybridMode::CpuOnly;
-    opt.optimization_flags &= ~OptimizationNcnnCpuBfloat16Linear;
     SchedulerOptions scheduler_options;
     scheduler_options.num_threads = 2;
     auto scheduler = runtime.create_scheduler(scheduler_options);
@@ -7928,7 +8201,6 @@ void test_chunked_prefill_statistics_commit_on_success()
     TestRuntime runtime;
     Option opt;
     opt.hybrid_mode = HybridMode::CpuOnly;
-    opt.optimization_flags &= ~OptimizationNcnnCpuBfloat16Linear;
     opt.optimization_flags |= OptimizationCpuBfloat16Batched;
     auto model = runtime.load_model(package.path(), opt);
     check(static_cast<bool>(model));
@@ -8280,7 +8552,7 @@ void test_staged_execution_failure_requires_reset()
     }
 }
 
-void test_speculative_commit_failure_requires_reset()
+void test_speculative_generation()
 {
     AttentionPackage package(false, 0, false, false);
     TestRuntime runtime;
@@ -8440,61 +8712,271 @@ void test_speculative_commit_failure_requires_reset()
     GenerationOptions options;
     options.max_new_tokens = 4;
     options.sampling.temperature = 0.0f;
+    options.speculative_confidence_threshold = 0.0f;
     const std::array<int32_t, 1> input = {0};
-    for (int failure = 0; failure < 3; ++failure)
+    for (int speculative_kind = 0; speculative_kind < 2; ++speculative_kind)
     {
-        auto session = runtime.create_session(model.value()).value();
-        const auto saved_bindings = compiled.speculative.layer_nodes;
-        bool callback_reached = false;
-        bool caught = false;
-        try
+        if (speculative_kind == 0)
         {
-            auto result = session->generate(input, options, [&](const StreamToken& token) {
-                if (token.index == 1)
+            GenerationOptions mtp_options = options;
+            mtp_options.max_new_tokens = 12;
+            for (uint32_t block_size : {2u, 4u, 8u})
+            {
+                compiled.speculative.block_size = block_size;
+                auto mtp_session = runtime.create_session(model.value()).value();
+                auto mtp_result = mtp_session->generate(input, mtp_options);
+                check(static_cast<bool>(mtp_result));
+                check(mtp_result.value().tokens.size() == mtp_options.max_new_tokens);
+                check(mtp_session->statistics().speculative_proposals > 0);
+                check(mtp_session->statistics().speculative_accepted_tokens > 0);
+
+                GenerationOptions ordinary_options = mtp_options;
+                ordinary_options.use_speculative = false;
+                auto ordinary_session = runtime.create_session(model.value()).value();
+                auto ordinary_result = ordinary_session->generate(input, ordinary_options);
+                check(static_cast<bool>(ordinary_result));
+                check(ordinary_result.value().tokens.size() == mtp_result.value().tokens.size());
+                for (size_t index = 0; index < mtp_result.value().tokens.size(); ++index)
                 {
-                    callback_reached = true;
-                    if (failure == 0)
-                    {
-                        // Proposal and verification have finished; fail the context update
-                        // after the target KV transaction has committed its accepted rows.
-                        compiled.speculative.layer_nodes.clear();
-                    }
-                    else if (failure == 1)
-                    {
-                        throw std::runtime_error("speculative callback failed");
-                    }
-                    else
-                    {
-                        check(static_cast<bool>(session->reset()));
-                    }
+                    check(mtp_result.value().tokens[index].token_id
+                          == ordinary_result.value().tokens[index].token_id);
+                    check(mtp_result.value().tokens[index].probability
+                          == ordinary_result.value().tokens[index].probability);
                 }
-                return true;
-            });
-            check(!result);
-            check(result.error().message == (failure == 0 ? "speculative execution graph has an incomplete layer binding" : "generation callback modified the Session"));
+            }
+            compiled.speculative.block_size = 2;
         }
-        catch (const std::runtime_error& error)
+        if (speculative_kind == 1)
         {
-            check(failure == 1);
-            check(std::string(error.what()) == "speculative callback failed");
-            caught = true;
+            auto add_float = [&compiled](const char* name,
+                                         std::initializer_list<uint32_t> shape,
+                                         std::initializer_list<float> values) {
+                TensorData tensor;
+                tensor.dtype = DType::Float32;
+                tensor.shape.assign(shape.begin(), shape.end());
+                tensor.float32_data.assign(values.begin(), values.end());
+                auto added = compiled.weights.add(name, std::move(tensor));
+                check(static_cast<bool>(added));
+                return added.value();
+            };
+
+            AttentionBlockPlan latent;
+            latent.kind = AttentionKind::MultiHeadLatent;
+            latent.head_count = 1;
+            latent.kv_head_count = 1;
+            latent.head_dimension = 2;
+            latent.sliding_window = 4;
+            latent.initial_context_length = 16;
+            latent.query_lora_rank = 1;
+            latent.rope_head_dimension = 2;
+            latent.output_lora_rank = 1;
+            latent.output_group_count = 1;
+            latent.norm_epsilon = compiled.descriptor.norm_epsilon;
+            latent.kv_cache_dtype = compiled.descriptor.kv_cache_dtype;
+            latent.pre_attention_norm_weight = add_float("test_dspark_pre_attention_norm", {2}, {1.0f, 1.0f});
+            latent.query_a_weight = add_float("test_dspark_query_a", {1, 2}, {0.5f, -0.25f});
+            latent.query_norm_weight = add_float("test_dspark_query_norm", {1}, {1.0f});
+            latent.query_b_weight = add_float("test_dspark_query_b", {2, 1}, {1.0f, 0.5f});
+            latent.key_value_weight = add_float("test_dspark_key_value", {2, 2}, {1.0f, 0.0f, 0.0f, 1.0f});
+            latent.key_value_norm_weight = add_float("test_dspark_key_value_norm", {2}, {1.0f, 1.0f});
+            latent.sinks = add_float("test_dspark_sinks", {1}, {0.0f});
+
+            TensorData output_a;
+            output_a.dtype = DType::Float8E4M3;
+            output_a.shape = {1, 2};
+            std::shared_ptr<uint8_t[]> output_a_storage(new uint8_t[2], std::default_delete<uint8_t[]>());
+            output_a_storage[0] = float_to_float8_e4m3(1.0f);
+            output_a_storage[1] = float_to_float8_e4m3(0.5f);
+            output_a.mapped_data = std::shared_ptr<const uint8_t>(output_a_storage, output_a_storage.get());
+            output_a.mapped_size = 2;
+            output_a.quantization_scales = {1.0f};
+            auto output_a_handle = compiled.weights.add("test_dspark_output_a", std::move(output_a));
+            check(static_cast<bool>(output_a_handle));
+            latent.output_a_weight = output_a_handle.value();
+            latent.output_b_weight = add_float("test_dspark_output_b", {2, 1}, {0.0f, 0.0f});
+            for (const ExpertPlan& expert : compiled.graph.layer_plans.front().moe.experts)
+            {
+                TensorData& down = compiled.weights.at_mutable(expert.down_weight);
+                std::fill(down.float32_data.begin(), down.float32_data.end(), 0.0f);
+            }
+            compiled.graph.layer_plans.front().attention = latent;
+
+            AttentionDescriptor& descriptor_attention = compiled.descriptor.layers.front().attention;
+            descriptor_attention.kind = AttentionKind::MultiHeadLatent;
+            descriptor_attention.head_count = 1;
+            descriptor_attention.kv_head_count = 1;
+            descriptor_attention.head_dimension = 2;
+            descriptor_attention.sliding_window = 4;
+            descriptor_attention.initial_context_length = 16;
+            descriptor_attention.query_lora_rank = 1;
+            descriptor_attention.kv_lora_rank = 2;
+            descriptor_attention.qk_rope_head_dimension = 2;
+            descriptor_attention.output_lora_rank = 1;
+            descriptor_attention.output_group_count = 1;
+
+            compiled.speculative.kind = SpeculativeModelKind::DSpark;
+            compiled.speculative.block_size = 2;
+            compiled.speculative.noise_token_id = 0;
+            compiled.speculative.markov_rank = 1;
+            compiled.speculative.target_layer_ids = {0};
+            compiled.speculative.graph.layer_plans = compiled.graph.layer_plans;
+            compiled.speculative.main_projection_weight = latent.key_value_weight;
+            compiled.speculative.main_norm_weight = latent.key_value_norm_weight;
+            compiled.speculative.final_norm_weight = compiled.final_norm_weight;
+            compiled.speculative.hyper_head_function = add_float("test_dspark_hyper_head_function", {1, 2}, {0.0f, 0.0f});
+            compiled.speculative.hyper_head_base = add_float("test_dspark_hyper_head_base", {1}, {1.0f});
+            compiled.speculative.hyper_head_scale = add_float("test_dspark_hyper_head_scale", {1}, {1.0f});
+            compiled.speculative.markov_embedding_weight = add_float("test_dspark_markov_embedding", {2, 1}, {1.0f, -1.0f});
+            compiled.speculative.markov_head_weight = add_float("test_dspark_markov_head", {2, 1}, {-1.0f, 1.0f});
+
+            TensorData confidence;
+            confidence.dtype = DType::BFloat16;
+            confidence.shape = {1, 3};
+            confidence.bfloat16_data = {
+                float_to_bfloat16(0.0f),
+                float_to_bfloat16(0.0f),
+                float_to_bfloat16(0.0f),
+            };
+            auto confidence_handle = compiled.weights.add("test_dspark_confidence", std::move(confidence));
+            check(static_cast<bool>(confidence_handle));
+            compiled.speculative.confidence_weight = confidence_handle.value();
+
+            compiled.operators.bind_weight_count(compiled.weights.size());
+            const std::vector<float> original_lm_head = compiled.weights.at(compiled.lm_head_weight).float32_data;
+            const std::vector<float> dspark_lm_head = {0.0f, 1.0f, 1.0f, 0.0f};
+            compiled.weights.at_mutable(compiled.lm_head_weight).float32_data = dspark_lm_head;
+            check(static_cast<bool>(build_graph(compiled, false)));
+            check(compiled.speculative.enabled());
+
+            // The two-token target alternates, so the final verification row
+            // must supply the next token after each fully accepted block.
+            GenerationOptions dspark_options = options;
+            dspark_options.max_new_tokens = 7;
+            auto dspark_session = runtime.create_session(model.value()).value();
+            auto dspark_result = dspark_session->generate(input, dspark_options);
+            check(static_cast<bool>(dspark_result));
+            check(dspark_result.value().tokens.size() == dspark_options.max_new_tokens);
+            check(dspark_session->statistics().speculative_proposals >= 2);
+            check(dspark_session->statistics().speculative_accepted_tokens >= 2);
+            for (size_t index = 0; index < dspark_result.value().tokens.size(); ++index)
+                check(dspark_result.value().tokens[index].token_id == (index % 2 == 0 ? 1 : 0));
+
+            GenerationOptions ordinary_options = dspark_options;
+            ordinary_options.use_speculative = false;
+            auto ordinary_session = runtime.create_session(model.value()).value();
+            auto ordinary_result = ordinary_session->generate(input, ordinary_options);
+            check(static_cast<bool>(ordinary_result));
+            check(ordinary_result.value().tokens.size() == dspark_result.value().tokens.size());
+            for (size_t index = 0; index < dspark_result.value().tokens.size(); ++index)
+                check(dspark_result.value().tokens[index].token_id == ordinary_result.value().tokens[index].token_id);
+
+            compiled.weights.at_mutable(latent.output_b_weight).float32_data = {1.0f, -0.25f};
+            compiled.weights.at_mutable(compiled.speculative.markov_head_weight).float32_data = {0.0f, 0.0f};
+            compiled.weights.at_mutable(compiled.lm_head_weight).float32_data = original_lm_head;
+            auto dspark_decode = dspark_session->decode(0);
+            auto ordinary_decode = ordinary_session->decode(0);
+            check(static_cast<bool>(dspark_decode));
+            check(static_cast<bool>(ordinary_decode));
+            check(dspark_decode.value().logits.size() == ordinary_decode.value().logits.size());
+            for (size_t column = 0; column < dspark_decode.value().logits.size(); ++column)
+                check_near(dspark_decode.value().logits[column], ordinary_decode.value().logits[column], 1e-5f);
+            compiled.weights.at_mutable(latent.output_b_weight).float32_data = {0.0f, 0.0f};
+            compiled.weights.at_mutable(compiled.lm_head_weight).float32_data = dspark_lm_head;
+            compiled.weights.at_mutable(compiled.speculative.markov_head_weight).float32_data = {-1.0f, 1.0f};
+
+            compiled.weights.at_mutable(compiled.speculative.markov_head_weight).float32_data = {0.0f, -8.0f};
+            GenerationOptions rejection_options = options;
+            rejection_options.max_new_tokens = 5;
+            auto rejection_session = runtime.create_session(model.value()).value();
+            auto rejection_result = rejection_session->generate(input, rejection_options);
+            check(static_cast<bool>(rejection_result));
+            check(rejection_result.value().tokens.size() == rejection_options.max_new_tokens);
+            check(rejection_session->statistics().speculative_proposals == 1);
+            check(rejection_session->statistics().speculative_accepted_tokens == 0);
+            for (size_t index = 0; index < rejection_result.value().tokens.size(); ++index)
+                check(rejection_result.value().tokens[index].token_id == (index % 2 == 0 ? 1 : 0));
+
+            ordinary_options.max_new_tokens = rejection_options.max_new_tokens;
+            auto rejection_control = runtime.create_session(model.value()).value();
+            auto rejection_control_result = rejection_control->generate(input, ordinary_options);
+            check(static_cast<bool>(rejection_control_result));
+            check(rejection_control_result.value().tokens.size() == rejection_result.value().tokens.size());
+            for (size_t index = 0; index < rejection_result.value().tokens.size(); ++index)
+                check(rejection_result.value().tokens[index].token_id == rejection_control_result.value().tokens[index].token_id);
+
+            compiled.weights.at_mutable(latent.output_b_weight).float32_data = {1.0f, -0.25f};
+            compiled.weights.at_mutable(compiled.speculative.markov_head_weight).float32_data = {0.0f, 0.0f};
+            compiled.weights.at_mutable(compiled.lm_head_weight).float32_data = original_lm_head;
+            auto rejection_decode = rejection_session->decode(0);
+            auto rejection_control_decode = rejection_control->decode(0);
+            check(static_cast<bool>(rejection_decode));
+            check(static_cast<bool>(rejection_control_decode));
+            check(rejection_decode.value().logits.size() == rejection_control_decode.value().logits.size());
+            for (size_t column = 0; column < rejection_decode.value().logits.size(); ++column)
+            {
+                check_near(rejection_decode.value().logits[column],
+                           rejection_control_decode.value().logits[column],
+                           1e-5f);
+            }
+            compiled.weights.at_mutable(latent.output_b_weight).float32_data = {0.0f, 0.0f};
+            compiled.weights.at_mutable(compiled.lm_head_weight).float32_data = dspark_lm_head;
+            compiled.weights.at_mutable(compiled.speculative.markov_head_weight).float32_data = {-1.0f, 1.0f};
         }
-        compiled.speculative.layer_nodes = saved_bindings;
-        check(callback_reached);
-        check(caught == (failure == 1));
-        if (failure == 0)
+
+        for (int failure = 0; failure < 3; ++failure)
         {
-            check_session_requires_reset(session, 1);
-            check(static_cast<bool>(session->reset()));
+            auto session = runtime.create_session(model.value()).value();
+            const auto saved_bindings = compiled.speculative.layer_nodes;
+            bool callback_reached = false;
+            bool caught = false;
+            try
+            {
+                auto result = session->generate(input, options, [&](const StreamToken& token) {
+                    if (token.index == 1)
+                    {
+                        callback_reached = true;
+                        if (failure == 0)
+                        {
+                            // Verification has completed; fail the context update after commit.
+                            compiled.speculative.layer_nodes.clear();
+                        }
+                        else if (failure == 1)
+                        {
+                            throw std::runtime_error("speculative callback failed");
+                        }
+                        else
+                        {
+                            check(static_cast<bool>(session->reset()));
+                        }
+                    }
+                    return true;
+                });
+                check(!result);
+                check(result.error().message == (failure == 0 ? "speculative execution graph has an incomplete layer binding" : "generation callback modified the Session"));
+            }
+            catch (const std::runtime_error& error)
+            {
+                check(failure == 1);
+                check(std::string(error.what()) == "speculative callback failed");
+                caught = true;
+            }
+            compiled.speculative.layer_nodes = saved_bindings;
+            check(callback_reached);
+            check(caught == (failure == 1));
+            if (failure == 0)
+            {
+                check_session_requires_reset(session, 1);
+                check(static_cast<bool>(session->reset()));
+            }
+            auto control = runtime.create_session(model.value()).value();
+            if (failure == 1)
+                check(static_cast<bool>(control->prefill(input)));
+            auto actual = session->decode(0);
+            auto expected = control->decode(0);
+            check(static_cast<bool>(actual));
+            check(static_cast<bool>(expected));
+            check(actual.value().logits == expected.value().logits);
         }
-        auto control = runtime.create_session(model.value()).value();
-        if (failure == 1)
-            check(static_cast<bool>(control->prefill(input)));
-        auto actual = session->decode(0);
-        auto expected = control->decode(0);
-        check(static_cast<bool>(actual));
-        check(static_cast<bool>(expected));
-        check(actual.value().logits == expected.value().logits);
     }
 }
 
@@ -9473,13 +9955,14 @@ void test_shared_expert_descriptor()
 
     std::array<SessionState, 3> staged_states;
     std::array<SessionStatistics, 3> staged_statistics;
+    std::array<std::vector<float>, 3> staged_logits;
     BatchWorkspace shared_batch_workspace;
     auto check_staged_batch = [&](std::span<const DecodeBatchEntry> entries) {
-        auto staged_logits = forward_decode_batch(nonzero_shared_model, entries, shared_batch_workspace);
-        check(static_cast<bool>(staged_logits));
-        check(staged_logits.value().size() == entries.size());
+        auto staged_status = forward_decode_batch(nonzero_shared_model, entries, shared_batch_workspace);
+        check(static_cast<bool>(staged_status));
         for (size_t session_index = 0; session_index < entries.size(); ++session_index)
         {
+            check(entries[session_index].logits != nullptr);
             SessionState reference_state;
             SessionStatistics reference_statistics;
             const std::array<int32_t, 1> input = {entries[session_index].input_id};
@@ -9487,29 +9970,29 @@ void test_shared_expert_descriptor()
                                                  reference_statistics, reference_state, 0);
             check(static_cast<bool>(expected_status));
             check(reference_state.logits.rows() == 1);
-            check(staged_logits.value()[session_index].size() == reference_state.logits.columns());
+            check(entries[session_index].logits->size() == reference_state.logits.columns());
             for (size_t column = 0; column < reference_state.logits.columns(); ++column)
-                check_near(staged_logits.value()[session_index][column], reference_state.logits.row(0)[column], 1e-5f);
+                check_near((*entries[session_index].logits)[column], reference_state.logits.row(0)[column], 1e-5f);
             check(entries[session_index].state->execution_state.shared_expert_output.rows() == 0);
         }
     };
     const std::array<DecodeBatchEntry, 3> first_staged_entries = {{
-        {0, &staged_statistics[0], &staged_states[0], 0},
-        {1, &staged_statistics[1], &staged_states[1], 0},
-        {2, &staged_statistics[2], &staged_states[2], 0},
+        {0, &staged_statistics[0], &staged_states[0], 0, &staged_logits[0]},
+        {1, &staged_statistics[1], &staged_states[1], 0, &staged_logits[1]},
+        {2, &staged_statistics[2], &staged_states[2], 0, &staged_logits[2]},
     }};
     check_staged_batch(first_staged_entries);
 
     const std::array<DecodeBatchEntry, 2> second_staged_entries = {{
-        {3, &staged_statistics[0], &staged_states[0], 0},
-        {0, &staged_statistics[2], &staged_states[2], 0},
+        {3, &staged_statistics[0], &staged_states[0], 0, &staged_logits[0]},
+        {0, &staged_statistics[2], &staged_states[2], 0, &staged_logits[2]},
     }};
     check_staged_batch(second_staged_entries);
 
     const std::array<DecodeBatchEntry, 3> third_staged_entries = {{
-        {1, &staged_statistics[0], &staged_states[0], 0},
-        {3, &staged_statistics[1], &staged_states[1], 0},
-        {0, &staged_statistics[2], &staged_states[2], 0},
+        {1, &staged_statistics[0], &staged_states[0], 0, &staged_logits[0]},
+        {3, &staged_statistics[1], &staged_states[1], 0, &staged_logits[1]},
+        {0, &staged_statistics[2], &staged_states[2], 0, &staged_logits[2]},
     }};
     check_staged_batch(third_staged_entries);
 
@@ -10300,6 +10783,155 @@ void test_expert_dispatcher_groups_routes()
     wide_options.top_k = 17;
     check_dispatch_matches_general(wide_logits, wide_options);
 
+    // Distinct logits can map to the same approximate softmax score after
+    // underflow; routing must still select them by their raw logit order.
+    ExpertDispatchOptions softmax_options;
+    softmax_options.expert_count = 3;
+    softmax_options.top_k = 2;
+    const std::array<float, 3> underflow_logits = {0.0f, -120.0f, -110.0f};
+    check(float_approximate_exp(underflow_logits[1]) == float_approximate_exp(underflow_logits[2]));
+    check(float_approximate_exp(underflow_logits[1]) == 0.0f);
+    ExpertDispatchPlan underflow_fast;
+    auto underflow_fast_status = forward_router(underflow_logits, 1, softmax_options, underflow_fast);
+    check(static_cast<bool>(underflow_fast_status));
+    check(underflow_fast.batches.size() == 2);
+    check(underflow_fast.batches[0].expert_id == 0 && underflow_fast.batches[1].expert_id == 2);
+    check(underflow_fast.batches[0].routes.front().rank == 0);
+    check(underflow_fast.batches[1].routes.front().rank == 1);
+    check(underflow_fast.batches[0].routes.front().weight == 1.0f);
+    check(underflow_fast.batches[1].routes.front().weight == 0.0f);
+
+    const std::array<float, 6> underflow_batch_logits = {0.0f, -120.0f, -110.0f,
+                                                         0.0f, -111.0f, -109.0f};
+    ExpertDispatchPlan underflow_general;
+    underflow_general.scores = {13.0f, 17.0f, 19.0f};
+    const float* preserved_score_data = underflow_general.scores.data();
+    auto underflow_general_status = forward_router(underflow_batch_logits, 2, softmax_options, underflow_general);
+    check(static_cast<bool>(underflow_general_status));
+    check(underflow_general.batches.size() == 2);
+    check(underflow_general.batches[0].expert_id == 0 && underflow_general.batches[1].expert_id == 2);
+    check(underflow_general.scores.data() == preserved_score_data);
+    check(underflow_general.scores.size() == 3);
+    check(underflow_general.scores[0] == 13.0f && underflow_general.scores[1] == 17.0f
+          && underflow_general.scores[2] == 19.0f);
+    for (const ExpertBatch& batch : underflow_general.batches)
+    {
+        check(batch.routes.size() == 2);
+        check(batch.routes[0].token_index == 0 && batch.routes[1].token_index == 1);
+        check(batch.routes[0].rank == (batch.expert_id == 0 ? 0u : 1u));
+        check(batch.routes[1].rank == (batch.expert_id == 0 ? 0u : 1u));
+        check(batch.routes[0].weight == (batch.expert_id == 0 ? 1.0f : 0.0f));
+        check(batch.routes[1].weight == (batch.expert_id == 0 ? 1.0f : 0.0f));
+    }
+
+    // Exact raw-logit ties keep the established lower-expert-id ordering.
+    softmax_options.expert_count = 4;
+    const std::array<float, 4> tied_softmax_logits = {0.0f, 2.0f, 2.0f, -1.0f};
+    ExpertDispatchPlan tied_softmax;
+    auto tied_softmax_status = forward_router(tied_softmax_logits, 1, softmax_options, tied_softmax);
+    check(static_cast<bool>(tied_softmax_status));
+    check(tied_softmax.batches.size() == 2);
+    check(tied_softmax.batches[0].expert_id == 1 && tied_softmax.batches[1].expert_id == 2);
+    check(tied_softmax.batches[0].routes.front().rank == 0);
+    check(tied_softmax.batches[1].routes.front().rank == 1);
+    check_near(tied_softmax.batches[0].routes.front().weight, 0.5f, 1e-6f);
+    check_near(tied_softmax.batches[1].routes.front().weight, 0.5f, 1e-6f);
+
+    // Top-K above the stack limit uses the multi-token general path while
+    // retaining the same raw ordering and leaving the score scratch untouched.
+    std::array<float, 40> wide_batch_logits{};
+    for (size_t expert_id = 0; expert_id < 20; ++expert_id)
+    {
+        wide_batch_logits[expert_id] = static_cast<float>(expert_id);
+        wide_batch_logits[20 + expert_id] = static_cast<float>(19 - expert_id);
+    }
+    ExpertDispatchPlan wide_batch;
+    wide_batch.scores = {23.0f, 29.0f};
+    const float* wide_score_data = wide_batch.scores.data();
+    auto wide_batch_status = forward_router(wide_batch_logits, 2, wide_options, wide_batch);
+    check(static_cast<bool>(wide_batch_status));
+    check(wide_batch.assignment_count == 34);
+    check(wide_batch.batches.size() == 20);
+    check(wide_batch.scores.data() == wide_score_data);
+    check(wide_batch.scores.size() == 2);
+    check(wide_batch.scores[0] == 23.0f && wide_batch.scores[1] == 29.0f);
+    float wide_denominator = 0.0f;
+    for (int score = 3; score <= 19; ++score)
+        wide_denominator += float_approximate_exp(static_cast<float>(score - 19));
+    for (uint32_t expert_id = 0; expert_id < 20; ++expert_id)
+    {
+        const ExpertBatch& batch = wide_batch.batches[expert_id];
+        check(batch.expert_id == expert_id);
+        const bool selected_by_first = expert_id >= 3;
+        const bool selected_by_second = expert_id <= 16;
+        check(batch.routes.size() == static_cast<size_t>(selected_by_first + selected_by_second));
+        size_t route_index = 0;
+        if (selected_by_first)
+        {
+            const ExpertRoute& route = batch.routes[route_index++];
+            check(route.token_index == 0 && route.rank == 19 - expert_id);
+            check_near(route.weight,
+                       float_approximate_exp(static_cast<float>(expert_id) - 19.0f) / wide_denominator,
+                       1e-6f);
+        }
+        if (selected_by_second)
+        {
+            const ExpertRoute& route = batch.routes[route_index];
+            check(route.token_index == 1 && route.rank == expert_id);
+            check_near(route.weight,
+                       float_approximate_exp(static_cast<float>(-static_cast<int>(expert_id))) / wide_denominator,
+                       1e-6f);
+        }
+    }
+
+    // Selection bias still ranks transformed scores. None publishes the
+    // original probability; SelectedExperts renormalizes that selected score.
+    ExpertDispatchOptions biased_softmax;
+    biased_softmax.expert_count = 3;
+    biased_softmax.top_k = 1;
+    const std::array<float, 3> softmax_bias = {0.0f, 2.0f, 0.0f};
+    biased_softmax.selection_bias = softmax_bias;
+    const std::array<float, 3> biased_logits = {3.0f, 2.0f, 0.0f};
+    const float bias_denominator = float_approximate_exp(0.0f) + float_approximate_exp(-1.0f)
+                                   + float_approximate_exp(-3.0f);
+    for (RouterNormalization normalization : {RouterNormalization::None, RouterNormalization::SelectedExperts})
+    {
+        biased_softmax.normalization = normalization;
+        ExpertDispatchPlan biased_result;
+        auto biased_status = forward_router(biased_logits, 1, biased_softmax, biased_result);
+        check(static_cast<bool>(biased_status));
+        check(biased_result.batches.size() == 1 && biased_result.batches[0].expert_id == 1);
+        const float expected_weight = normalization == RouterNormalization::None
+                                          ? float_approximate_exp(-1.0f) / bias_denominator
+                                          : 1.0f;
+        check_near(biased_result.batches[0].routes.front().weight, expected_weight, 1e-6f);
+    }
+
+    // Explicit Softmax IDs stay on the fallback path even when their raw score
+    // is outside top-K and their selected weight underflows to zero.
+    ExpertDispatchOptions explicit_underflow_options;
+    explicit_underflow_options.expert_count = 2;
+    explicit_underflow_options.top_k = 1;
+    const std::array<uint32_t, 1> underflow_expert_ids = {1};
+    explicit_underflow_options.explicit_expert_ids = underflow_expert_ids;
+    const std::array<float, 2> explicit_underflow_logits = {0.0f, -120.0f};
+    ExpertDispatchPlan explicit_underflow;
+    auto explicit_underflow_status = forward_router(explicit_underflow_logits, 1, explicit_underflow_options,
+                                                    explicit_underflow);
+    check(!explicit_underflow_status);
+    check(explicit_underflow_status.error().code == ErrorCode::InvalidModel);
+    check(explicit_underflow_status.error().message == "selected router weights have a non-positive sum");
+
+    const std::array<uint32_t, 2> batch_underflow_expert_ids = {1, 1};
+    explicit_underflow_options.explicit_expert_ids = batch_underflow_expert_ids;
+    const std::array<float, 4> batch_underflow_logits = {0.0f, -120.0f, 0.0f, -120.0f};
+    ExpertDispatchPlan batch_underflow;
+    auto batch_underflow_status = forward_router(batch_underflow_logits, 2, explicit_underflow_options,
+                                                 batch_underflow);
+    check(!batch_underflow_status);
+    check(batch_underflow_status.error().code == ErrorCode::InvalidModel);
+    check(batch_underflow_status.error().message == "selected router weights have a non-positive sum");
+
     ExpertDispatchOptions duplicate_options;
     duplicate_options.expert_count = 4;
     duplicate_options.top_k = 2;
@@ -10973,12 +11605,10 @@ void test_deepseek_router_and_hyper_connection_kernels()
     }
     ActivationBuffer bfloat16_pair_first_output;
     ActivationBuffer bfloat16_pair_second_output;
-    const bool bfloat16_pair_used = forward_linear_pair(bfloat16_pair_first,
-                                                        bfloat16_pair_second,
-                                                        bfloat16_pair_input,
-                                                        bfloat16_pair_first_output,
-                                                        bfloat16_pair_second_output,
-                                                        g_test_optimization_flags);
+    const bool bfloat16_pair_used = forward_linear({&bfloat16_pair_first, &bfloat16_pair_second},
+                                                   bfloat16_pair_input,
+                                                   {&bfloat16_pair_first_output, &bfloat16_pair_second_output},
+                                                   g_test_optimization_flags);
 #if defined(__aarch64__) || defined(_M_ARM64)
     check(bfloat16_pair_used);
     for (const auto& projection : {std::pair<const TensorData*, const ActivationBuffer*>{
@@ -11003,78 +11633,68 @@ void test_deepseek_router_and_hyper_connection_kernels()
     ActivationBuffer untouched_pair_output(1, 2);
     untouched_pair_output.row(0)[0] = 3.0f;
     untouched_pair_output.row(0)[1] = -4.0f;
-    check(!forward_linear_pair(bfloat16_pair_first,
-                               mismatched_bfloat16_pair,
-                               bfloat16_pair_input,
-                               untouched_pair_output,
-                               bfloat16_pair_second_output,
-                               g_test_optimization_flags));
+    check(!forward_linear({&bfloat16_pair_first, &mismatched_bfloat16_pair},
+                          bfloat16_pair_input,
+                          {&untouched_pair_output, &bfloat16_pair_second_output},
+                          g_test_optimization_flags));
     check(untouched_pair_output.columns() == 2);
     check(untouched_pair_output.row(0)[0] == 3.0f);
     check(untouched_pair_output.row(0)[1] == -4.0f);
-    check(!forward_linear_pair(bfloat16_pair_first,
-                               bfloat16_pair_second,
-                               bfloat16_pair_input,
-                               untouched_pair_output,
-                               untouched_pair_output,
-                               g_test_optimization_flags));
+    check(!forward_linear({&bfloat16_pair_first, &bfloat16_pair_second},
+                          bfloat16_pair_input,
+                          {&untouched_pair_output, &untouched_pair_output},
+                          g_test_optimization_flags));
     check(untouched_pair_output.columns() == 2);
     check(untouched_pair_output.row(0)[0] == 3.0f);
-    check(!forward_linear_pair(bfloat16_pair_first,
-                               bfloat16_pair_second,
-                               bfloat16_pair_input,
-                               bfloat16_pair_input,
-                               bfloat16_pair_second_output,
-                               g_test_optimization_flags));
+    check(!forward_linear({&bfloat16_pair_first, &bfloat16_pair_second},
+                          bfloat16_pair_input,
+                          {&bfloat16_pair_input, &bfloat16_pair_second_output},
+                          g_test_optimization_flags));
     check(bfloat16_pair_input.row(0)[0] == -0.21875f);
     TensorData missing_bfloat16_storage = bfloat16_pair_second;
     missing_bfloat16_storage.bfloat16_data.clear();
-    check(!forward_linear_pair(bfloat16_pair_first,
-                               missing_bfloat16_storage,
-                               bfloat16_pair_input,
-                               untouched_pair_output,
-                               bfloat16_pair_second_output,
-                               g_test_optimization_flags));
+    check(!forward_linear({&bfloat16_pair_first, &missing_bfloat16_storage},
+                          bfloat16_pair_input,
+                          {&untouched_pair_output, &bfloat16_pair_second_output},
+                          g_test_optimization_flags));
     check(untouched_pair_output.columns() == 2);
     check(untouched_pair_output.row(0)[0] == 3.0f);
     ActivationBuffer bfloat16_pair_non_float_output(1, 2, DType::BFloat16);
-    check(!forward_linear_pair(bfloat16_pair_first,
-                               bfloat16_pair_second,
-                               bfloat16_pair_input,
-                               bfloat16_pair_non_float_output,
-                               bfloat16_pair_second_output,
-                               g_test_optimization_flags));
+    check(!forward_linear({&bfloat16_pair_first, &bfloat16_pair_second},
+                          bfloat16_pair_input,
+                          {&bfloat16_pair_non_float_output, &bfloat16_pair_second_output},
+                          g_test_optimization_flags));
     ActivationBuffer bfloat16_pair_non_float_input(1, pair_bfloat16_columns, DType::BFloat16);
-    check(!forward_linear_pair(bfloat16_pair_first,
-                               bfloat16_pair_second,
-                               bfloat16_pair_non_float_input,
-                               untouched_pair_output,
-                               bfloat16_pair_second_output,
-                               g_test_optimization_flags));
-#if NCNN_MOE_WITH_NCNN
-    TensorData bfloat16_pair_linear_weight;
-    bfloat16_pair_linear_weight.dtype = DType::Float32;
-    bfloat16_pair_linear_weight.shape = {2, pair_bfloat16_columns};
-    bfloat16_pair_linear_weight.float32_data.resize(bfloat16_pair_linear_weight.element_count(), 0.125f);
-    const auto bfloat16_pair_linear = Linear::create(bfloat16_pair_linear_weight,
-                                                     nullptr,
-                                                     LinearDevice::Cpu,
-                                                     automatic_vulkan_device_index,
-                                                     {},
-                                                     g_test_optimization_flags);
-    check(static_cast<bool>(bfloat16_pair_linear));
-    CompiledOperator bfloat16_pair_operator;
-    bfloat16_pair_operator.linear = bfloat16_pair_linear;
-    check(!forward_linear_pair(bfloat16_pair_first,
-                               bfloat16_pair_second,
-                               bfloat16_pair_input,
-                               untouched_pair_output,
-                               bfloat16_pair_second_output,
-                               g_test_optimization_flags,
-                               &bfloat16_pair_operator));
-    check(untouched_pair_output.columns() == 2);
-    check(untouched_pair_output.row(0)[0] == 3.0f);
+    check(!forward_linear({&bfloat16_pair_first, &bfloat16_pair_second},
+                          bfloat16_pair_non_float_input,
+                          {&untouched_pair_output, &bfloat16_pair_second_output},
+                          g_test_optimization_flags));
+#if NCNN_MOE_WITH_NCNN && NCNN_MOE_WITH_VULKAN
+    if (get_gpu_count() > 0)
+    {
+        TensorData pair_linear_weight;
+        pair_linear_weight.dtype = DType::Float32;
+        pair_linear_weight.shape = {2, pair_bfloat16_columns};
+        pair_linear_weight.float32_data.resize(pair_linear_weight.element_count(), 0.125f);
+        const VulkanRuntimePtr pair_runtime = create_vulkan_runtime();
+        const auto pair_linear = Linear::create(pair_linear_weight,
+                                                nullptr,
+                                                get_default_gpu_index(),
+                                                pair_runtime,
+                                                g_test_optimization_flags);
+        check(static_cast<bool>(pair_linear));
+        CompiledOperator pair_operator;
+        pair_operator.linear = pair_linear;
+        check(!forward_linear({&bfloat16_pair_first, &bfloat16_pair_second},
+                              bfloat16_pair_input,
+                              {&untouched_pair_output, &bfloat16_pair_second_output},
+                              g_test_optimization_flags,
+                              {&pair_operator, nullptr}));
+        check(untouched_pair_output.columns() == 2);
+        check(untouched_pair_output.row(0)[0] == 3.0f);
+    }
 #endif
+
 #else
     check(!bfloat16_pair_used);
 #endif
@@ -11133,12 +11753,10 @@ void test_deepseek_router_and_hyper_connection_kernels()
     }
     ActivationBuffer paired_gate;
     ActivationBuffer paired_up;
-    check(forward_linear_pair(float8_gate,
-                              float8_up,
-                              fused_input,
-                              paired_gate,
-                              paired_up,
-                              g_test_optimization_flags));
+    check(forward_linear({&float8_gate, &float8_up},
+                         fused_input,
+                         {&paired_gate, &paired_up},
+                         g_test_optimization_flags));
     for (size_t token_index = 0; token_index < fused_input.rows();
          ++token_index)
     {
@@ -11154,29 +11772,23 @@ void test_deepseek_router_and_hyper_connection_kernels()
     ActivationBuffer scratch_pair_gate;
     ActivationBuffer scratch_pair_up;
     ActivationBuffer quantized_input_scratch;
-    check(forward_linear_pair(float8_gate,
-                              float8_up,
-                              fused_input,
-                              scratch_pair_gate,
-                              scratch_pair_up,
-                              g_test_optimization_flags,
-                              nullptr,
-                              nullptr,
-                              &quantized_input_scratch));
+    check(forward_linear({&float8_gate, &float8_up},
+                         fused_input,
+                         {&scratch_pair_gate, &scratch_pair_up},
+                         g_test_optimization_flags,
+                         {},
+                         &quantized_input_scratch));
     const size_t initial_quantized_capacity = quantized_input_scratch.allocated_bytes();
     const std::byte* initial_quantized_address = quantized_input_scratch.bytes().data();
     std::fill(quantized_input_scratch.mutable_bytes().begin(),
               quantized_input_scratch.mutable_bytes().end(),
               std::byte{0xa5});
-    check(forward_linear_pair(float8_gate,
-                              float8_up,
-                              fused_input,
-                              scratch_pair_gate,
-                              scratch_pair_up,
-                              g_test_optimization_flags,
-                              nullptr,
-                              nullptr,
-                              &quantized_input_scratch));
+    check(forward_linear({&float8_gate, &float8_up},
+                         fused_input,
+                         {&scratch_pair_gate, &scratch_pair_up},
+                         g_test_optimization_flags,
+                         {},
+                         &quantized_input_scratch));
     check(quantized_input_scratch.allocated_bytes() == initial_quantized_capacity);
     check(quantized_input_scratch.bytes().data() == initial_quantized_address);
     for (size_t token_index = 0; token_index < fused_input.rows();
@@ -11200,21 +11812,16 @@ void test_deepseek_router_and_hyper_connection_kernels()
     }
     ActivationBuffer larger_default_gate;
     ActivationBuffer larger_default_up;
-    check(forward_linear_pair(float8_gate,
-                              float8_up,
-                              larger_fused_input,
-                              larger_default_gate,
-                              larger_default_up,
-                              g_test_optimization_flags));
-    check(forward_linear_pair(float8_gate,
-                              float8_up,
-                              larger_fused_input,
-                              scratch_pair_gate,
-                              scratch_pair_up,
-                              g_test_optimization_flags,
-                              nullptr,
-                              nullptr,
-                              &quantized_input_scratch));
+    check(forward_linear({&float8_gate, &float8_up},
+                         larger_fused_input,
+                         {&larger_default_gate, &larger_default_up},
+                         g_test_optimization_flags));
+    check(forward_linear({&float8_gate, &float8_up},
+                         larger_fused_input,
+                         {&scratch_pair_gate, &scratch_pair_up},
+                         g_test_optimization_flags,
+                         {},
+                         &quantized_input_scratch));
     const size_t grown_quantized_capacity = quantized_input_scratch.allocated_bytes();
     const std::byte* grown_quantized_address = quantized_input_scratch.bytes().data();
     check(grown_quantized_capacity >= initial_quantized_capacity);
@@ -11232,15 +11839,12 @@ void test_deepseek_router_and_hyper_connection_kernels()
     std::fill(quantized_input_scratch.mutable_bytes().begin(),
               quantized_input_scratch.mutable_bytes().end(),
               std::byte{0x5a});
-    check(forward_linear_pair(float8_gate,
-                              float8_up,
-                              fused_input,
-                              scratch_pair_gate,
-                              scratch_pair_up,
-                              g_test_optimization_flags,
-                              nullptr,
-                              nullptr,
-                              &quantized_input_scratch));
+    check(forward_linear({&float8_gate, &float8_up},
+                         fused_input,
+                         {&scratch_pair_gate, &scratch_pair_up},
+                         g_test_optimization_flags,
+                         {},
+                         &quantized_input_scratch));
     check(quantized_input_scratch.allocated_bytes() == grown_quantized_capacity);
     check(quantized_input_scratch.bytes().data() == grown_quantized_address);
     for (size_t token_index = 0; token_index < fused_input.rows();
@@ -11254,16 +11858,247 @@ void test_deepseek_router_and_hyper_connection_kernels()
                        paired_up.row(token_index)[column], 1e-6f);
         }
     }
-    ActivationBuffer scratch_linear_output;
-    check(forward_linear_pair(float8_gate,
-                              float8_up,
-                              fused_input,
-                              scratch_pair_gate,
-                              scratch_pair_up,
+
+    const std::array<TensorData, 4> four_float8_matrices{
+        make_float8_projection(3, 129),
+        make_float8_projection(4, 257),
+        make_float8_projection(5, 385),
+        make_float8_projection(6, 513)};
+    ActivationBuffer four_float8_input(8, 128);
+    for (size_t token_index = 0; token_index < four_float8_input.rows();
+         ++token_index)
+    {
+        for (uint32_t column = 0; column < four_float8_input.columns(); ++column)
+        {
+            four_float8_input.row(token_index)[column] = static_cast<float>(static_cast<int>((token_index * 17 + column * 5) % 37)
+                                                                            - 18)
+                                                         * 0.015625f;
+        }
+    }
+    const ActivationBuffer four_float8_input_copy = four_float8_input;
+    const uint64_t four_float8_workload = (129u + 257u + 385u + 513u)
+                                          * 128u * four_float8_input.rows();
+    std::array<ActivationBuffer, 4> four_float8_outputs;
+    for (size_t i = 0; i < four_float8_outputs.size(); ++i)
+    {
+        four_float8_outputs[i].reset(1, 2, false);
+        four_float8_outputs[i].row(0)[0] = static_cast<float>(81 + i);
+        four_float8_outputs[i].row(0)[1] = static_cast<float>(-91 - i);
+    }
+    ActivationBuffer four_float8_quantized_input;
+    {
+        CpuOpenMpThreadLimitScope thread_limit;
+        thread_limit.set(1);
+        check(cpu_linear_team_size(four_float8_workload, DType::Float8E4M3) == 1);
+        check(!forward_linear({&four_float8_matrices[0], &four_float8_matrices[1],
+                               &four_float8_matrices[2], &four_float8_matrices[3]},
+                              four_float8_input,
+                              {&four_float8_outputs[0], &four_float8_outputs[1],
+                               &four_float8_outputs[2], &four_float8_outputs[3]},
                               g_test_optimization_flags,
-                              nullptr,
-                              nullptr,
-                              &quantized_input_scratch));
+                              {},
+                              &four_float8_quantized_input));
+        for (size_t i = 0; i < four_float8_outputs.size(); ++i)
+        {
+            check(four_float8_outputs[i].columns() == 2);
+            check(four_float8_outputs[i].row(0)[0] == static_cast<float>(81 + i));
+            check(four_float8_outputs[i].row(0)[1] == static_cast<float>(-91 - i));
+        }
+        check(four_float8_quantized_input.rows() == 0);
+    }
+
+    {
+        CpuOpenMpThreadLimitScope thread_limit;
+        thread_limit.set(8);
+        const int selected_team = cpu_linear_team_size(four_float8_workload,
+                                                       DType::Float8E4M3);
+        const bool four_used = forward_linear({&four_float8_matrices[0], &four_float8_matrices[1],
+                                               &four_float8_matrices[2], &four_float8_matrices[3]},
+                                              four_float8_input,
+                                              {&four_float8_outputs[0], &four_float8_outputs[1],
+                                               &four_float8_outputs[2], &four_float8_outputs[3]},
+                                              g_test_optimization_flags,
+                                              {},
+                                              &four_float8_quantized_input);
+        if (selected_team == 1)
+        {
+            check(!four_used);
+            for (size_t i = 0; i < four_float8_outputs.size(); ++i)
+            {
+                check(four_float8_outputs[i].columns() == 2);
+                check(four_float8_outputs[i].row(0)[0] == static_cast<float>(81 + i));
+            }
+            check(four_float8_quantized_input.rows() == 0);
+        }
+        else
+        {
+            check(four_used);
+            std::array<ActivationBuffer, 4> first_four_outputs;
+            for (size_t i = 0; i < four_float8_outputs.size(); ++i)
+            {
+                check(four_float8_outputs[i].columns() == four_float8_matrices[i].shape[0]);
+                first_four_outputs[i] = four_float8_outputs[i];
+                const ActivationBuffer expected = forward_linear(four_float8_matrices[i],
+                                                                 four_float8_input,
+                                                                 g_test_optimization_flags);
+                check(first_four_outputs[i].rows() == expected.rows());
+                check(first_four_outputs[i].columns() == expected.columns());
+                for (size_t row = 0; row < expected.rows(); ++row)
+                {
+                    for (uint32_t column = 0; column < expected.columns(); ++column)
+                    {
+                        check_near(first_four_outputs[i].row(row)[column],
+                                   expected.row(row)[column], 1e-6f);
+                    }
+                }
+            }
+            const size_t four_quantized_capacity = four_float8_quantized_input.allocated_bytes();
+            const std::byte* four_quantized_address = four_float8_quantized_input.bytes().data();
+            std::fill(four_float8_quantized_input.mutable_bytes().begin(),
+                      four_float8_quantized_input.mutable_bytes().end(),
+                      std::byte{0xa5});
+            check(forward_linear({&four_float8_matrices[0], &four_float8_matrices[1],
+                                  &four_float8_matrices[2], &four_float8_matrices[3]},
+                                 four_float8_input,
+                                 {&four_float8_outputs[0], &four_float8_outputs[1],
+                                  &four_float8_outputs[2], &four_float8_outputs[3]},
+                                 g_test_optimization_flags,
+                                 {},
+                                 &four_float8_quantized_input));
+            check(four_float8_quantized_input.allocated_bytes() == four_quantized_capacity);
+            check(four_float8_quantized_input.bytes().data() == four_quantized_address);
+            for (size_t i = 0; i < four_float8_outputs.size(); ++i)
+            {
+                for (size_t row = 0; row < first_four_outputs[i].rows(); ++row)
+                {
+                    for (uint32_t column = 0; column < first_four_outputs[i].columns(); ++column)
+                    {
+                        check_near(four_float8_outputs[i].row(row)[column],
+                                   first_four_outputs[i].row(row)[column], 1e-6f);
+                    }
+                }
+            }
+        }
+    }
+    check(std::memcmp(four_float8_input.bytes().data(),
+                      four_float8_input_copy.bytes().data(),
+                      four_float8_input.bytes().size())
+          == 0);
+
+    const ActivationBuffer four_float8_quantized_before_rejections = four_float8_quantized_input;
+    ActivationBuffer four_reject_output0(1, 2);
+    ActivationBuffer four_reject_output1(1, 2);
+    ActivationBuffer four_reject_output2(1, 2);
+    ActivationBuffer four_reject_output3(1, 2);
+    four_reject_output0.row(0)[0] = 101.0f;
+    four_reject_output1.row(0)[0] = 102.0f;
+    four_reject_output2.row(0)[0] = 103.0f;
+    four_reject_output3.row(0)[0] = 104.0f;
+    TensorData four_wrong_dtype = four_float8_matrices[2];
+    four_wrong_dtype.dtype = DType::BFloat16;
+    check(!forward_linear({&four_float8_matrices[0], &four_float8_matrices[1],
+                           &four_wrong_dtype, &four_float8_matrices[3]},
+                          four_float8_input,
+                          {&four_reject_output0, &four_reject_output1,
+                           &four_reject_output2, &four_reject_output3},
+                          g_test_optimization_flags));
+    TensorData four_wrong_shape = four_float8_matrices[2];
+    four_wrong_shape.shape[1] = 127;
+    check(!forward_linear({&four_float8_matrices[0], &four_float8_matrices[1],
+                           &four_wrong_shape, &four_float8_matrices[3]},
+                          four_float8_input,
+                          {&four_reject_output0, &four_reject_output1,
+                           &four_reject_output2, &four_reject_output3},
+                          g_test_optimization_flags));
+    check(!forward_linear({&four_float8_matrices[0], &four_float8_matrices[1],
+                           &four_float8_matrices[2]},
+                          four_float8_input,
+                          {&four_reject_output0, &four_reject_output1,
+                           &four_reject_output2},
+                          g_test_optimization_flags));
+    check(!forward_linear({&four_float8_matrices[0], &four_float8_matrices[1],
+                           &four_float8_matrices[2], &four_float8_matrices[3],
+                           &four_float8_matrices[0]},
+                          four_float8_input,
+                          {&four_reject_output0, &four_reject_output1,
+                           &four_reject_output2, &four_reject_output3,
+                           &four_reject_output0},
+                          g_test_optimization_flags));
+    check(!forward_linear({&four_float8_matrices[0], &four_float8_matrices[1],
+                           &four_float8_matrices[2], &four_float8_matrices[3]},
+                          four_float8_input,
+                          {&four_reject_output0, &four_reject_output1,
+                           &four_reject_output2},
+                          g_test_optimization_flags));
+    check(!forward_linear({&four_float8_matrices[0], nullptr,
+                           &four_float8_matrices[2], &four_float8_matrices[3]},
+                          four_float8_input,
+                          {&four_reject_output0, &four_reject_output1,
+                           &four_reject_output2, &four_reject_output3},
+                          g_test_optimization_flags));
+    check(!forward_linear({&four_float8_matrices[0], &four_float8_matrices[1],
+                           &four_float8_matrices[2], &four_float8_matrices[3]},
+                          four_float8_input,
+                          {&four_reject_output0, nullptr,
+                           &four_reject_output2, &four_reject_output3},
+                          g_test_optimization_flags));
+    check(!forward_linear({&four_float8_matrices[0], &four_float8_matrices[1],
+                           &four_float8_matrices[2], &four_float8_matrices[3]},
+                          four_float8_input,
+                          {&four_reject_output0, &four_reject_output1,
+                           &four_reject_output2, &four_reject_output3},
+                          g_test_optimization_flags,
+                          {nullptr, nullptr,
+                           nullptr}));
+    check(!forward_linear({&four_float8_matrices[0], &four_float8_matrices[1],
+                           &four_float8_matrices[2], &four_float8_matrices[3]},
+                          four_float8_input,
+                          {&four_reject_output0, &four_reject_output1,
+                           &four_reject_output2, &four_reject_output3},
+                          g_test_optimization_flags,
+                          {},
+                          &four_float8_input));
+    check(!forward_linear({&four_float8_matrices[0], &four_float8_matrices[1],
+                           &four_float8_matrices[2], &four_float8_matrices[3]},
+                          four_float8_input,
+                          {&four_reject_output0, &four_reject_output1,
+                           &four_reject_output2, &four_reject_output3},
+                          g_test_optimization_flags,
+                          {},
+                          &four_reject_output0));
+    check(!forward_linear({&four_float8_matrices[0], &four_float8_matrices[1],
+                           &four_float8_matrices[2], &four_float8_matrices[3]},
+                          four_float8_input,
+                          {&four_float8_input, &four_reject_output1,
+                           &four_reject_output2, &four_reject_output3},
+                          g_test_optimization_flags));
+    check(!forward_linear({&four_float8_matrices[0], &four_float8_matrices[1],
+                           &four_float8_matrices[2], &four_float8_matrices[3]},
+                          four_float8_input,
+                          {&four_reject_output0, &four_reject_output0,
+                           &four_reject_output2, &four_reject_output3},
+                          g_test_optimization_flags));
+    check(four_float8_quantized_input.rows() == four_float8_quantized_before_rejections.rows());
+    check(four_float8_quantized_input.columns() == four_float8_quantized_before_rejections.columns());
+    check(four_float8_quantized_input.allocated_bytes()
+          == four_float8_quantized_before_rejections.allocated_bytes());
+    check(four_float8_quantized_before_rejections.bytes().empty()
+          || std::memcmp(four_float8_quantized_input.bytes().data(),
+                         four_float8_quantized_before_rejections.bytes().data(),
+                         four_float8_quantized_before_rejections.bytes().size())
+                 == 0);
+    check(four_reject_output0.columns() == 2 && four_reject_output0.row(0)[0] == 101.0f);
+    check(four_reject_output1.columns() == 2 && four_reject_output1.row(0)[0] == 102.0f);
+    check(four_reject_output2.columns() == 2 && four_reject_output2.row(0)[0] == 103.0f);
+    check(four_reject_output3.columns() == 2 && four_reject_output3.row(0)[0] == 104.0f);
+
+    ActivationBuffer scratch_linear_output;
+    check(forward_linear({&float8_gate, &float8_up},
+                         fused_input,
+                         {&scratch_pair_gate, &scratch_pair_up},
+                         g_test_optimization_flags,
+                         {},
+                         &quantized_input_scratch));
     forward_linear(float8_gate,
                    fused_input,
                    scratch_linear_output,
@@ -11847,23 +12682,18 @@ void test_latent_attention_scratch_reuse()
     ActivationBuffer pair_probe_values;
     ActivationBuffer pair_probe_scores;
     ActivationBuffer pair_probe_scratch;
-    check(forward_linear_pair(float8_compressor_value,
-                              float8_compressor_gate,
-                              compressed_input,
-                              pair_probe_values,
-                              pair_probe_scores,
-                              g_test_optimization_flags,
-                              nullptr,
-                              nullptr,
-                              &pair_probe_scratch));
+    check(forward_linear({&float8_compressor_value, &float8_compressor_gate},
+                         compressed_input,
+                         {&pair_probe_values, &pair_probe_scores},
+                         g_test_optimization_flags,
+                         {},
+                         &pair_probe_scratch));
     ActivationBuffer mixed_probe_values;
     ActivationBuffer mixed_probe_scores;
-    check(!forward_linear_pair(float8_compressor_value,
-                               mixed_compressor_gate,
-                               compressed_input,
-                               mixed_probe_values,
-                               mixed_probe_scores,
-                               g_test_optimization_flags));
+    check(!forward_linear({&float8_compressor_value, &mixed_compressor_gate},
+                          compressed_input,
+                          {&mixed_probe_values, &mixed_probe_scores},
+                          g_test_optimization_flags));
 
     auto check_activation_parity = [&](const ActivationBuffer& left, const ActivationBuffer& right) {
         check(left.rows() == right.rows());
@@ -13308,15 +14138,17 @@ void test_qwen4_exp_compile_and_execute()
           <= expert_pair_size);
 
     const uint64_t prefill_cache_misses = statistics.expert_cache_misses;
+    std::vector<float> decoded_logits;
     const std::array<DecodeBatchEntry, 1> entries = {{
         4,
         &statistics,
         &state,
         prompt.size(),
+        &decoded_logits,
     }};
     auto decoded = forward_decode_batch(compiled, entries, batch_workspace);
     check(static_cast<bool>(decoded));
-    check(decoded.value().size() == 1);
+    check(decoded_logits.size() == compiled.descriptor.vocabulary_size);
     check(state.layers[1].ple_token_history
           == std::vector<int32_t>({3, 4}));
     check(state.layers[3].qsa_block_keys.size()
@@ -13800,6 +14632,17 @@ void test_gated_residual_kernels()
     const TensorHandle inject = add_bfloat16_tensor(weights, "gr_inject", {2, 4},
                                                     {0.0f, 0.0f, 0.0f, 0.0f,
                                                      0.0f, 0.0f, 0.0f, 0.0f});
+    CompiledOperatorTable operators;
+    MoeModelDescriptor descriptor;
+    descriptor.hyper_connection_multiplier = 2;
+    descriptor.hidden_size = 2;
+    descriptor.norm_epsilon = 1e-6f;
+    descriptor.norm_weight_offset = 1.0f;
+    GatedResidualPlan plan;
+    plan.norm_weight = norm;
+    plan.mix_down_weight = mix_down;
+    plan.mix_up_weight = mix_up;
+    plan.inject_weight = inject;
 
     ActivationBuffer input(1, 4);
     input.row(0)[0] = 1.0f;
@@ -13810,14 +14653,10 @@ void test_gated_residual_kernels()
     HyperConnectionMix mixed;
     HyperConnectionScratch gated_scratch;
     auto mixed_result = forward_gated_residual_pre(input,
-                                                   weights.at(norm),
-                                                   weights.at(mix_down),
-                                                   weights.at(mix_up),
-                                                   weights.at(inject),
-                                                   2,
-                                                   2,
-                                                   epsilon,
-                                                   1.0f,
+                                                   weights,
+                                                   operators,
+                                                   plan,
+                                                   descriptor,
                                                    mixed,
                                                    gated_scratch,
                                                    0);
@@ -13838,14 +14677,10 @@ void test_gated_residual_kernels()
     for (size_t row = 0; row < larger_input.rows(); ++row)
         std::copy_n(input.row(0), input.columns(), larger_input.row(row));
     auto enlarged = forward_gated_residual_pre(larger_input,
-                                               weights.at(norm),
-                                               weights.at(mix_down),
-                                               weights.at(mix_up),
-                                               weights.at(inject),
-                                               2,
-                                               2,
-                                               epsilon,
-                                               1.0f,
+                                               weights,
+                                               operators,
+                                               plan,
+                                               descriptor,
                                                mixed,
                                                gated_scratch,
                                                0);
@@ -13855,14 +14690,10 @@ void test_gated_residual_kernels()
     const std::byte* grown_reduced_data = mixed.reduced.bytes().data();
     const std::byte* grown_normalized_data = gated_scratch.normalized.bytes().data();
     auto restored = forward_gated_residual_pre(input,
-                                               weights.at(norm),
-                                               weights.at(mix_down),
-                                               weights.at(mix_up),
-                                               weights.at(inject),
-                                               2,
-                                               2,
-                                               epsilon,
-                                               1.0f,
+                                               weights,
+                                               operators,
+                                               plan,
+                                               descriptor,
                                                mixed,
                                                gated_scratch,
                                                0);
@@ -13874,23 +14705,49 @@ void test_gated_residual_kernels()
 
     TensorData malformed_norm = weights.at(norm);
     malformed_norm.shape.clear();
-    auto invalid_norm = forward_gated_residual_pre(input, malformed_norm, weights.at(mix_down), weights.at(mix_up), weights.at(inject),
-                                                   2, 2, epsilon, 1.0f, mixed, gated_scratch, 0);
+    auto malformed_norm_added = weights.add("gr_malformed_norm", malformed_norm);
+    check(static_cast<bool>(malformed_norm_added));
+    GatedResidualPlan malformed_norm_plan = plan;
+    malformed_norm_plan.norm_weight = malformed_norm_added.value();
+    auto invalid_norm = forward_gated_residual_pre(input,
+                                                   weights,
+                                                   operators,
+                                                   malformed_norm_plan,
+                                                   descriptor,
+                                                   mixed,
+                                                   gated_scratch,
+                                                   0);
     check(!invalid_norm);
     check(invalid_norm.error().code == ErrorCode::InvalidModel);
     check(invalid_norm.error().message == "invalid gated-residual normalization tensor");
 
-    malformed_norm.shape = {2, 2};
-    auto invalid_norm_rank = forward_gated_residual_pre(input, malformed_norm, weights.at(mix_down), weights.at(mix_up), weights.at(inject),
-                                                        2, 2, epsilon, 1.0f, mixed, gated_scratch, 0);
+    weights.at_mutable(malformed_norm_added.value()).shape = {2, 2};
+    auto invalid_norm_rank = forward_gated_residual_pre(input,
+                                                        weights,
+                                                        operators,
+                                                        malformed_norm_plan,
+                                                        descriptor,
+                                                        mixed,
+                                                        gated_scratch,
+                                                        0);
     check(!invalid_norm_rank);
     check(invalid_norm_rank.error().code == ErrorCode::InvalidModel);
     check(invalid_norm_rank.error().message == "invalid gated-residual normalization tensor");
 
     TensorData malformed_mix_up = weights.at(mix_up);
     malformed_mix_up.shape = {2, 2};
-    auto invalid_mix_up = forward_gated_residual_pre(input, weights.at(norm), weights.at(mix_down), malformed_mix_up, weights.at(inject),
-                                                     2, 2, epsilon, 1.0f, mixed, gated_scratch, 0);
+    auto malformed_mix_up_added = weights.add("gr_malformed_mix_up", malformed_mix_up);
+    check(static_cast<bool>(malformed_mix_up_added));
+    GatedResidualPlan malformed_mix_up_plan = plan;
+    malformed_mix_up_plan.mix_up_weight = malformed_mix_up_added.value();
+    auto invalid_mix_up = forward_gated_residual_pre(input,
+                                                     weights,
+                                                     operators,
+                                                     malformed_mix_up_plan,
+                                                     descriptor,
+                                                     mixed,
+                                                     gated_scratch,
+                                                     0);
     check(!invalid_mix_up);
     check(invalid_mix_up.error().code == ErrorCode::InvalidModel);
     check(invalid_mix_up.error().message == "invalid gated-residual up projection");
@@ -13923,13 +14780,10 @@ void test_gated_residual_kernels()
     ActivationBuffer head_output(1, 1);
     head_output.row(0)[0] = 123.0f;
     auto head = forward_gated_residual_head(input,
-                                            weights.at(norm),
-                                            weights.at(mix_down),
-                                            weights.at(mix_up),
-                                            2,
-                                            2,
-                                            epsilon,
-                                            1.0f,
+                                            weights,
+                                            operators,
+                                            plan,
+                                            descriptor,
                                             head_output,
                                             gated_scratch,
                                             0);
@@ -13937,14 +14791,13 @@ void test_gated_residual_kernels()
     check_near(head_output.row(0)[0], expected_head[0], 1e-6f);
     check_near(head_output.row(0)[1], expected_head[1], 1e-6f);
     std::fill_n(head_output.row(0), head_output.columns(), 456.0f);
+    GatedResidualPlan head_plan = plan;
+    head_plan.inject_weight = invalid_tensor_handle;
     head = forward_gated_residual_head(input,
-                                       weights.at(norm),
-                                       weights.at(mix_down),
-                                       weights.at(mix_up),
-                                       2,
-                                       2,
-                                       epsilon,
-                                       1.0f,
+                                       weights,
+                                       operators,
+                                       head_plan,
+                                       descriptor,
                                        head_output,
                                        gated_scratch,
                                        0);
@@ -13952,13 +14805,10 @@ void test_gated_residual_kernels()
     check_near(head_output.row(0)[0], expected_head[0], 1e-6f);
     check_near(head_output.row(0)[1], expected_head[1], 1e-6f);
     auto aliased_head = forward_gated_residual_head(input,
-                                                    weights.at(norm),
-                                                    weights.at(mix_down),
-                                                    weights.at(mix_up),
-                                                    2,
-                                                    2,
-                                                    epsilon,
-                                                    1.0f,
+                                                    weights,
+                                                    operators,
+                                                    plan,
+                                                    descriptor,
                                                     input,
                                                     gated_scratch,
                                                     0);
@@ -13971,6 +14821,12 @@ void test_gated_residual_kernels()
 void test_ple_prefill_decode_continuation()
 {
     WeightStore weights;
+    CompiledOperatorTable operators;
+    MoeModelDescriptor descriptor;
+    descriptor.hyper_connection_multiplier = 2;
+    descriptor.hidden_size = 2;
+    descriptor.norm_epsilon = 1e-6f;
+    descriptor.norm_weight_offset = 1.0f;
     PleBlockPlan plan;
     plan.embedding_dimension = 4;
     plan.convolution_kernel_size = 2;
@@ -14009,11 +14865,9 @@ void test_ple_prefill_decode_continuation()
     LayerCache prefill_cache;
     AttentionScratch prefill_scratch;
     check(static_cast<bool>(forward_ple(weights,
+                                        operators,
                                         plan,
-                                        2,
-                                        2,
-                                        1e-6f,
-                                        1.0f,
+                                        descriptor,
                                         input_ids,
                                         prefill_cache,
                                         prefill_scratch,
@@ -14037,11 +14891,9 @@ void test_ple_prefill_decode_continuation()
         ActivationBuffer token_hidden(1, 4);
         const std::array<int32_t, 1> token = {input_ids[row]};
         check(static_cast<bool>(forward_ple(weights,
+                                            operators,
                                             plan,
-                                            2,
-                                            2,
-                                            1e-6f,
-                                            1.0f,
+                                            descriptor,
                                             token,
                                             decode_cache,
                                             decode_scratch,
@@ -14100,16 +14952,16 @@ void test_ple_prefill_decode_continuation()
         AttentionScratch canonical_scratch;
         AttentionScratch batch_scratch;
         ActivationBuffer batch_hidden(tokens.size(), 4);
-        check(static_cast<bool>(forward_ple(weights, ring_plan, 2, 2, 1e-6f, 1.0f,
+        check(static_cast<bool>(forward_ple(weights, operators, ring_plan, descriptor,
                                             tokens, batch_cache, batch_scratch, batch_hidden, 0)));
         for (size_t row = 0; row < tokens.size(); ++row)
         {
             const std::span<const int32_t> token(tokens.data() + row, 1);
             ActivationBuffer ring_hidden(1, 4);
             ActivationBuffer canonical_hidden(1, 4);
-            check(static_cast<bool>(forward_ple(weights, ring_plan, 2, 2, 1e-6f, 1.0f,
+            check(static_cast<bool>(forward_ple(weights, operators, ring_plan, descriptor,
                                                 token, ring_cache, ring_scratch, ring_hidden, 0)));
-            check(static_cast<bool>(forward_ple(weights, ring_plan, 2, 2, 1e-6f, 1.0f,
+            check(static_cast<bool>(forward_ple(weights, operators, ring_plan, descriptor,
                                                 token, canonical_cache, canonical_scratch, canonical_hidden, 0)));
             for (size_t column = 0; column < 4; ++column)
             {
@@ -14129,7 +14981,7 @@ void test_ple_prefill_decode_continuation()
         check(ring_cache.ple_first_slot == batch_cache.ple_first_slot);
         ring_cache = {};
         ActivationBuffer reset_hidden(1, 4);
-        check(static_cast<bool>(forward_ple(weights, ring_plan, 2, 2, 1e-6f, 1.0f,
+        check(static_cast<bool>(forward_ple(weights, operators, ring_plan, descriptor,
                                             std::span<const int32_t>(tokens.data(), 1), ring_cache, ring_scratch, reset_hidden, 0)));
         for (size_t column = 0; column < 4; ++column)
             check_near(reset_hidden.row(0)[column], batch_hidden.row(0)[column], 1e-6f);
@@ -14186,12 +15038,16 @@ void test_ple_prefill_decode_continuation()
         ActivationBuffer hash_hidden(hash_input_ids.size(), 4);
         LayerCache hash_cache;
         AttentionScratch hash_scratch;
+        CompiledOperatorTable hash_operators;
+        MoeModelDescriptor hash_descriptor;
+        hash_descriptor.hyper_connection_multiplier = 1;
+        hash_descriptor.hidden_size = 4;
+        hash_descriptor.norm_epsilon = 1e-6f;
+        hash_descriptor.norm_weight_offset = 1.0f;
         check(static_cast<bool>(forward_ple(hash_weights,
+                                            hash_operators,
                                             hash_plan,
-                                            1,
-                                            4,
-                                            1e-6f,
-                                            1.0f,
+                                            hash_descriptor,
                                             hash_input_ids,
                                             hash_cache,
                                             hash_scratch,
@@ -14434,6 +15290,113 @@ void test_attention_output_aliases()
                             check_near(actual.values()[index], expected.values()[index], 1e-4f);
                     }
                 }
+    // Compare grouped QK against independent per-key FP32 attention, including GQA and ring tails.
+    thread_limit.set(1);
+    for (uint32_t dimension : {32u, 80u, 128u})
+    {
+        const uint64_t capacity = dimension == 80 ? 521u : 13u;
+        const uint32_t width = 4 * dimension;
+        const uint32_t cache_width = 2 * dimension;
+        std::vector<float> identity(static_cast<size_t>(width) * width, 0.0f);
+        for (uint32_t column = 0; column < width; ++column)
+            identity[static_cast<size_t>(column) * width + column] = 1.0f;
+        const std::string prefix = "qk_batch_" + std::to_string(dimension);
+        AttentionBlockPlan batch_plan;
+        batch_plan.kind = AttentionKind::Standard;
+        batch_plan.head_count = 4;
+        batch_plan.kv_head_count = 2;
+        batch_plan.head_dimension = dimension;
+        batch_plan.value_head_dimension = dimension;
+        batch_plan.kv_cache_dtype = DType::BFloat16;
+        batch_plan.query_weight = add_float_tensor(weights, prefix + "query", {width, width}, identity);
+        batch_plan.output_weight = add_float_tensor(weights, prefix + "output", {width, width}, identity);
+        identity.resize(static_cast<size_t>(cache_width) * width);
+        batch_plan.key_weight = add_float_tensor(weights, prefix + "key", {cache_width, width}, identity);
+        batch_plan.value_weight = add_float_tensor(weights, prefix + "value", {cache_width, width}, identity);
+        if (dimension == 80)
+            batch_plan.sinks = add_float_tensor(weights, prefix + "sink", {4}, {0.125f, -0.0625f, 0.1875f, 0.03125f});
+        const uint64_t flags = g_test_optimization_flags
+                               | OptimizationCpuBf16DirectAttention
+                               | OptimizationCpuFlashAttention
+                               | OptimizationCpuSplitKvAttention;
+        const uint64_t reference_flags = flags & ~OptimizationCpuBf16DirectAttention
+                                         & ~OptimizationCpuFlashAttention
+                                         & ~OptimizationCpuSplitKvAttention;
+        const std::vector<uint64_t> contexts = dimension == 80
+                                                   ? std::vector<uint64_t>{63, 64, 65, 511, 512}
+                                                   : std::vector<uint64_t>{3, 4, 6, 7, 8};
+        const std::vector<uint64_t> first_slots = dimension == 80
+                                                      ? std::vector<uint64_t>{0, capacity - 59, capacity - 1}
+                                                      : std::vector<uint64_t>{0, capacity - 3, capacity - 1};
+        const std::vector<uint32_t> thread_counts = dimension == 80
+                                                        ? std::vector<uint32_t>{1, 8}
+                                                        : std::vector<uint32_t>{1};
+        for (uint32_t threads : thread_counts)
+        {
+            thread_limit.set(threads);
+            AttentionScratch batch_scratch;
+            AttentionScratch fallback_scratch;
+            for (uint64_t context : contexts)
+                for (uint64_t first : first_slots)
+                {
+                    const uint64_t stored_context = dimension == 80 ? context - 1 : context;
+                    LayerCache cache;
+                    cache.dtype = DType::BFloat16;
+                    cache.columns = cache_width;
+                    cache.capacity_tokens = capacity;
+                    cache.first_slot = first;
+                    cache.start_position = 7;
+                    cache.token_count = stored_context;
+                    cache.bfloat16_keys.resize(capacity * cache_width);
+                    cache.bfloat16_values.resize(capacity * cache_width);
+                    for (uint64_t token = 0; token < stored_context; ++token)
+                        for (uint32_t column = 0; column < cache_width; ++column)
+                        {
+                            const size_t offset = (first + token) % capacity * cache_width + column;
+                            cache.bfloat16_keys[offset] = float_to_bfloat16(static_cast<float>(static_cast<int>((token * 7 + column * 3) % 29) - 14) * 0.03125f);
+                            cache.bfloat16_values[offset] = float_to_bfloat16(static_cast<float>(static_cast<int>((token * 11 + column * 5) % 31) - 15) * 0.0625f);
+                        }
+                    LayerCache reference_cache = cache;
+                    ActivationBuffer input(1, width);
+                    for (uint32_t column = 0; column < width; ++column)
+                        input.row(0)[column] = static_cast<float>(static_cast<int>((column * 13) % 37) - 18) * 0.0234375f;
+                    AttentionScratch& active_scratch = dimension == 80 && context == 512
+                                                           ? fallback_scratch
+                                                           : batch_scratch;
+                    const float poison = std::numeric_limits<float>::quiet_NaN();
+                    std::fill(active_scratch.workspace.begin(), active_scratch.workspace.end(), poison);
+                    std::fill(active_scratch.logits.begin(), active_scratch.logits.end(), poison);
+                    std::fill(active_scratch.flash_partial_max.begin(), active_scratch.flash_partial_max.end(), poison);
+                    std::fill(active_scratch.flash_partial_sum.begin(), active_scratch.flash_partial_sum.end(), poison);
+                    std::fill(active_scratch.flash_partial_output.begin(), active_scratch.flash_partial_output.end(), poison);
+                    AttentionScratch reference_scratch;
+                    ActivationBuffer expected;
+                    ActivationBuffer actual;
+                    check(static_cast<bool>(forward_attention(weights, operators, batch_plan, ExecutionBackend::Cpu, 7 + stored_context,
+                                                              reference_cache, reference_scratch, input, expected,
+                                                              reference_flags)));
+                    check(static_cast<bool>(forward_attention(weights, operators, batch_plan, ExecutionBackend::Cpu, 7 + stored_context,
+                                                              cache, active_scratch, input, actual, flags)));
+                    check(active_scratch.key_cache.empty());
+                    check(active_scratch.value_cache.empty());
+                    if (dimension == 80)
+                    {
+                        if (context >= 64 && context < 512)
+                            check(!active_scratch.workspace.empty());
+                        else if (context == 63 || context == 512)
+                            check(active_scratch.workspace.empty());
+                    }
+                    check(cache.first_slot == reference_cache.first_slot);
+                    check(cache.token_count == reference_cache.token_count);
+                    check(cache.bfloat16_keys == reference_cache.bfloat16_keys);
+                    check(cache.bfloat16_values == reference_cache.bfloat16_values);
+                    check(actual.rows() == expected.rows());
+                    check(actual.columns() == expected.columns());
+                    for (size_t index = 0; index < actual.values().size(); ++index)
+                        check_near(actual.values()[index], expected.values()[index], 1e-4f);
+                }
+        }
+    }
 }
 
 void test_qsa_prefill_decode_continuation()
@@ -15054,17 +16017,22 @@ void test_gated_delta_net_continuation()
     for (size_t index = 0; index < expected_recurrent.size(); ++index)
         check_near(prefill_cache.gated_delta_recurrent[index], expected_recurrent[index], 1e-5f);
 
-#if NCNN_MOE_WITH_NCNN
     const CompiledOperatorHandle fused_delta_handle = operators.allocate();
-    operators.at_mutable(fused_delta_handle).linear = Linear::create_fused({
-                                                                               &weights.at(plan.delta_qkv_weight),
-                                                                               &weights.at(plan.delta_z_weight),
-                                                                               &weights.at(plan.delta_beta_weight),
-                                                                               &weights.at(plan.delta_alpha_weight),
-                                                                           },
-                                                                           {nullptr, nullptr, nullptr, nullptr}, LinearDevice::Cpu, automatic_vulkan_device_index, vulkan_runtime, g_test_optimization_flags);
+#if NCNN_MOE_WITH_NCNN && NCNN_MOE_WITH_VULKAN
+    if (get_gpu_count() > 0)
+    {
+        auto fused_operator = Linear::create_fused({
+                                                       &weights.at(plan.delta_qkv_weight),
+                                                       &weights.at(plan.delta_z_weight),
+                                                       &weights.at(plan.delta_beta_weight),
+                                                       &weights.at(plan.delta_alpha_weight),
+                                                   },
+                                                   {nullptr, nullptr, nullptr, nullptr}, get_default_gpu_index(), vulkan_runtime, g_test_optimization_flags);
+        check(static_cast<bool>(fused_operator));
+        operators.at_mutable(fused_delta_handle).linear = std::move(fused_operator);
+    }
+#endif
     plan.fused_delta_input_operator = fused_delta_handle;
-    check(static_cast<bool>(operators.at(fused_delta_handle).linear));
     LayerCache fused_cache;
     GatedDeltaScratch fused_scratch;
     ActivationBuffer fused_output;
@@ -15106,7 +16074,6 @@ void test_gated_delta_net_continuation()
                    prefill_cache.gated_delta_recurrent[index],
                    1e-5f);
     }
-#endif
 
     LayerCache first_row_cache;
     GatedDeltaScratch first_row_scratch;
@@ -15227,10 +16194,7 @@ void test_gated_delta_net_continuation()
     };
     cpu_gdn_release_model.operators.bind_weight_count(cpu_gdn_release_model.weights.size());
     const CompiledOperatorHandle cpu_gdn_handle = cpu_gdn_release_model.operators.allocate();
-#if NCNN_MOE_WITH_NCNN
     cpu_gdn_release_model.operators.at_mutable(cpu_gdn_handle).linear = operators.at(fused_delta_handle).linear;
-    check(static_cast<bool>(cpu_gdn_release_model.operators.at(cpu_gdn_handle).linear));
-#endif
     CompiledLayerPlan cpu_gdn_layer;
     cpu_gdn_layer.attention.kind = AttentionKind::GatedDeltaNet;
     cpu_gdn_layer.attention.fused_delta_input_operator = cpu_gdn_handle;
@@ -15617,7 +16581,6 @@ void test_batch_workspace_reuse()
     TestRuntime runtime;
     Option opt;
     opt.hybrid_mode = HybridMode::CpuOnly;
-    opt.optimization_flags &= ~OptimizationNcnnCpuBfloat16Linear;
     const auto moe_model = runtime.load_model(moe_package.path(), opt).value();
     const auto attention_model = runtime.load_model(attention_package.path(), opt).value();
     const auto large_model = runtime.load_model(large_package.path(), opt).value();
@@ -15663,18 +16626,26 @@ void test_batch_workspace_reuse()
         std::array<SessionStatistics, 3> statistics;
         std::array<SessionStatistics, 3> reference_statistics;
         std::array<uint64_t, 3> positions = {};
+        std::array<std::vector<float>, 3> logits;
+        std::array<const float*, 3> output_data;
+        for (size_t row = 0; row < logits.size(); ++row)
+        {
+            logits[row].reserve(compiled.descriptor.vocabulary_size);
+            output_data[row] = logits[row].data();
+        }
+        std::vector<DecodeBatchEntry> entries;
         for (size_t count : {3u, 1u, 2u, 3u})
         {
-            std::vector<DecodeBatchEntry> entries;
+            entries.clear();
             for (size_t row = 0; row < count; ++row)
             {
                 const size_t index = count - row - 1;
                 entries.push_back({static_cast<int32_t>((positions[index] + index) % compiled.descriptor.vocabulary_size),
-                                   &statistics[index], &states[index], positions[index], row != 1});
+                                   &statistics[index], &states[index], positions[index],
+                                   row != 1 ? &logits[row] : nullptr});
             }
             auto result = forward_decode_batch(execution_model, entries, workspace);
             check(static_cast<bool>(result));
-            check(result.value().size() == count);
             for (size_t row = 0; row < count; ++row)
             {
                 const size_t index = count - row - 1;
@@ -15682,19 +16653,27 @@ void test_batch_workspace_reuse()
                 auto expected_status = forward_model(compiled, input, reference_statistics[index], references[index], positions[index]);
                 check(static_cast<bool>(expected_status));
                 check(references[index].logits.rows() == 1);
-                if (entries[row].output_logits)
+                if (entries[row].logits)
                 {
-                    check(result.value()[row].size() == references[index].logits.columns());
-                    for (size_t column = 0; column < result.value()[row].size(); ++column)
-                        check_near(result.value()[row][column], references[index].logits.row(0)[column], 1e-5f);
+                    check(logits[row].data() == output_data[row]);
+                    check(logits[row].size() == references[index].logits.columns());
+                    for (size_t column = 0; column < logits[row].size(); ++column)
+                        check_near(logits[row][column], references[index].logits.row(0)[column], 1e-5f);
                 }
                 else
-                    check(result.value()[row].empty());
+                    check(logits[row].empty());
                 check(states[index].expert_scratch.staged_merged.allocated_bytes() == 0);
                 ++positions[index];
             }
             check_released();
         }
+        check(execution_model.graph.nodes[execution_model.schedule.node_order.back()].type == ExecutionNodeType::LmHead);
+        execution_model.schedule.node_order.pop_back();
+        auto missing_logits = forward_decode_batch(execution_model, entries, workspace);
+        check(!missing_logits);
+        check(missing_logits.error().message == "staged execution graph did not produce logits");
+        check(logits[0].empty() && logits[2].empty());
+        check_released();
     };
     run_model(moe_model);
     run_model(large_model);
@@ -15706,9 +16685,10 @@ void test_batch_workspace_reuse()
     {
         std::array<SessionState, 2> states;
         std::array<SessionStatistics, 2> statistics;
+        std::array<std::vector<float>, 2> logits = {{{123.0f}, {456.0f}}};
         const std::array<DecodeBatchEntry, 2> entries = {{
-            {0, &statistics[0], &states[0], 0},
-            {1, &statistics[1], &states[1], 0},
+            {0, &statistics[0], &states[0], 0, &logits[0]},
+            {1, &statistics[1], &states[1], 0, &logits[1]},
         }};
         {
             ScopedLmHeadFailure failure(*attention_model, exception);
@@ -15724,6 +16704,7 @@ void test_batch_workspace_reuse()
             }
             check(failed);
         }
+        check(logits[0].empty() && logits[1].empty());
         check_released();
         run_model(attention_model);
     }
@@ -16633,14 +17614,6 @@ void test_backend_capabilities_and_hybrid_execution()
 
 void test_flag_defaults()
 {
-    check(static_cast<bool>(has_flag(OptimizationDefaultFlags,
-                                     OptimizationVulkanPipelineBindElision)));
-    check(static_cast<bool>(has_flag(OptimizationDefaultFlags,
-                                     OptimizationVulkanReadonlyBindings)));
-    check(static_cast<bool>(has_flag(OptimizationDefaultFlags,
-                                     OptimizationVulkanBatchBufferBarriers)));
-    check(static_cast<bool>(has_flag(OptimizationDefaultFlags,
-                                     OptimizationVulkanStackDescriptorPayload)));
     check(static_cast<bool>(has_flag(OptimizationDefaultFlags,
                                      OptimizationVulkanCommandGraph)));
     check(static_cast<bool>(has_flag(OptimizationDefaultFlags,
@@ -17900,12 +18873,12 @@ void test_dense_expert_thread_budget()
     // matrix teams and serial execution, including reused uneven batches.
     for (DType dtype : {DType::Float32, DType::BFloat16})
     {
-        for (uint32_t hidden : {32u, 1024u, 256u, 1025u})
+        for (uint32_t hidden : {32u, 1024u, 256u, 257u, 1025u})
         {
             if (dtype == DType::Float32 && hidden != 32 && hidden != 1024)
                 continue;
             const bool grouped_bfloat16_case = dtype == DType::BFloat16
-                                               && (hidden == 256 || hidden == 1025);
+                                               && (hidden == 256 || hidden == 257 || hidden == 1025);
             const uint32_t intermediate = hidden == 1025 ? 2051u : hidden * 2;
             CompiledModel model;
             model.descriptor.hidden_size = hidden;
@@ -18050,8 +19023,86 @@ void test_dense_expert_thread_budget()
                         }
                         const ActivationBuffer& expected = reference[active.batch.expert_id];
                         for (size_t index = 0; index < active.output.values().size(); ++index)
+                        {
                             check_near(active.output.values()[index], expected.values()[index], 1e-5f + 1e-5f * std::abs(expected.values()[index]));
+#if defined(_OPENMP) && (defined(__aarch64__) || defined(_M_ARM64))
+                            if (grouped_bfloat16_case && token_count == 1)
+                                check(std::bit_cast<uint32_t>(active.output.values()[index]) == std::bit_cast<uint32_t>(expected.values()[index]));
+#endif
+                        }
                     }
+                }
+            }
+            if (hidden == 32)
+            {
+                std::vector<float> previous_output;
+                for (uint32_t pass = 0; pass < 3; ++pass)
+                {
+                    const size_t route_count = pass == 1 ? 3 : 1;
+                    state.normalized.reset(1, hidden, false);
+                    for (uint32_t column = 0; column < hidden; ++column)
+                    {
+                        const int sample = static_cast<int>((column * 11 + pass * 7) % 29) - 14;
+                        state.normalized.row(0)[column] = static_cast<float>(sample) * 0.03125f;
+                    }
+                    state.reset();
+                    for (uint32_t expert_id = 0; expert_id < moe.experts.size(); ++expert_id)
+                    {
+                        ExpertState& active = state.active_experts()[expert_id];
+                        active.batch.expert_id = expert_id;
+                        active.batch.routes.assign(route_count, {0, expert_id, 1.0f});
+                    }
+                    thread_limit.set(1);
+                    SessionStatistics statistics;
+                    const auto status = forward_moe(model,
+                                                    moe,
+                                                    state,
+                                                    statistics,
+                                                    scratch,
+                                                    0,
+                                                    ExecutionBackend::Cpu,
+                                                    false);
+                    check(static_cast<bool>(status));
+                    check(state.experts_executed && !state.normalized_device);
+                    for (const ExpertState& active : state.active_experts())
+                    {
+                        check(active.input.rows() == (route_count == 1 ? 0 : route_count));
+                        if (route_count != 1)
+                        {
+                            check(active.input.columns() == hidden);
+                            for (size_t row = 0; row < route_count; ++row)
+                                for (uint32_t column = 0; column < hidden; ++column)
+                                    check(active.input.row(row)[column] == state.normalized.row(0)[column]);
+                        }
+                        check(active.output.rows() == route_count && active.output.columns() == hidden);
+
+                        const ExpertPlan& expert = moe.experts[active.batch.expert_id];
+                        const ActivationBuffer projected = forward_linear(model.weights.at(expert.gate_up_weight),
+                                                                          model.weights.at(expert.gate_up_bias),
+                                                                          state.normalized,
+                                                                          model.opt.optimization_flags);
+                        ActivationBuffer activated(1, intermediate);
+                        for (uint32_t column = 0; column < intermediate; ++column)
+                            activated.row(0)[column] = scaled_silu(projected.row(0)[column], 1.0f, model.opt.optimization_flags)
+                                                       * projected.row(0)[intermediate + column];
+                        const ActivationBuffer expected = forward_linear(model.weights.at(expert.down_weight),
+                                                                         model.weights.at(expert.down_bias),
+                                                                         activated,
+                                                                         model.opt.optimization_flags);
+                        for (size_t row = 0; row < route_count; ++row)
+                            for (uint32_t column = 0; column < hidden; ++column)
+                                check_near(active.output.row(row)[column], expected.row(0)[column],
+                                           1e-5f + 1e-5f * std::abs(expected.row(0)[column]));
+                    }
+                    const ExpertState& first = state.active_experts().front();
+                    if (!previous_output.empty())
+                    {
+                        bool changed = false;
+                        for (uint32_t column = 0; column < hidden; ++column)
+                            changed = changed || std::abs(first.output.row(0)[column] - previous_output[column]) > 1e-6f;
+                        check(changed);
+                    }
+                    previous_output.assign(first.output.row(0), first.output.row(0) + hidden);
                 }
             }
         }
@@ -18386,16 +19437,16 @@ void test_bfloat16_batched_linear_kernel()
             check(static_cast<bool>(single_output[output_column] == expected[output_column]));
         }
 
-        Bfloat16BatchedLinearExecutionCounter first_counter;
-        Bfloat16BatchedLinearExecutionCounter second_counter;
+        Bf16Counter first_counter;
+        Bf16Counter second_counter;
         std::vector<float> first_output(output.size());
         std::vector<float> second_output(output.size());
         std::atomic<uint32_t> ready{0};
         std::atomic<bool> start{false};
         std::atomic<bool> scoped_dispatches_succeeded{true};
-        auto run_scoped = [&](Bfloat16BatchedLinearExecutionCounter& counter,
+        auto run_scoped = [&](Bf16Counter& counter,
                               std::vector<float>& scoped_output) {
-            const ScopedBfloat16BatchedLinearExecutionCounter scope(&counter);
+            const Bf16Scope scope(&counter);
             ready.fetch_add(1, std::memory_order_relaxed);
             while (!start.load(std::memory_order_acquire))
                 std::this_thread::yield();
@@ -18426,8 +19477,8 @@ void test_bfloat16_batched_linear_kernel()
         first_worker.join();
         second_worker.join();
         check(scoped_dispatches_succeeded.load(std::memory_order_relaxed));
-        check(static_cast<bool>(first_counter.dispatch_count() == 1));
-        check(static_cast<bool>(second_counter.dispatch_count() == 1));
+        check(static_cast<bool>(first_counter.dispatches() == 1));
+        check(static_cast<bool>(second_counter.dispatches() == 1));
     }
     else
     {
@@ -19104,11 +20155,7 @@ int main(int argc, char** argv)
             ncnn::moe::benchmark_vulkan_qnk_expert();
             return 0;
         }
-        if (argument == "--disable-vulkan-pipeline-bind-elision")
-        {
-            ncnn::moe::g_test_optimization_flags &= ~ncnn::moe::OptimizationVulkanPipelineBindElision;
-        }
-        else if (!argument.empty())
+        if (!argument.empty())
         {
             std::cerr << "unknown test argument: " << argument << '\n';
             return 2;
@@ -19137,7 +20184,7 @@ int main(int argc, char** argv)
         ncnn::moe::test_float_to_bfloat16_array();
         ncnn::moe::test_activation_buffer_reset();
         ncnn::moe::test_bfloat16_batched_linear_kernel();
-        ncnn::moe::test_ncnn_linear_operator();
+        ncnn::moe::test_linear_operator();
         ncnn::moe::test_vulkan_device_tensor_residency();
         ncnn::moe::test_dense_mxn_tiles();
         ncnn::moe::test_released_dense_host_storage_guard();
@@ -19167,7 +20214,7 @@ int main(int argc, char** argv)
         ncnn::moe::test_staged_invalid_token_preserves_attention_state();
         ncnn::moe::test_session_execution_failure_requires_reset();
         ncnn::moe::test_staged_execution_failure_requires_reset();
-        ncnn::moe::test_speculative_commit_failure_requires_reset();
+        ncnn::moe::test_speculative_generation();
         ncnn::moe::test_prefill_decode_and_reset();
         ncnn::moe::test_invalid_token_is_transactional();
         ncnn::moe::test_chunked_prefill_matches_single_batch();

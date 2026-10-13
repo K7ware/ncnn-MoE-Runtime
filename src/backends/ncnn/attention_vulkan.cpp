@@ -993,7 +993,7 @@ std::shared_ptr<Attention_vulkan> Attention_vulkan::create(const TensorData& nor
     // Wrapped KV rings require VkMat offset views.
     return {};
 #endif
-    if (!fused_qkv || !output_projection || !fused_qkv->uses_vulkan() || !output_projection->uses_vulkan() || config.hidden_size == 0 || config.head_count == 0
+    if (!fused_qkv || !output_projection || config.hidden_size == 0 || config.head_count == 0
         || config.kv_head_count == 0 || config.head_dimension == 0 || config.head_dimension % 2 != 0 || config.head_count % config.kv_head_count != 0
         || config.activation_dtype != config.kv_cache_dtype || (!has_flag(config.flags, AttentionSink) && config.sliding_window > 0)
         || norm_weight.shape != std::vector<uint32_t>{config.hidden_size}

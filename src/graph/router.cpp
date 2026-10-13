@@ -62,6 +62,8 @@ static void select_topk_routes(const float* scores, std::span<const float> selec
             expert_id,
             scores[expert_id] + (selection_bias.empty() ? 0.0f : selection_bias[expert_id]),
         };
+        if (selected.size() == top_k && route_precedes(selected.back(), candidate))
+            continue;
         const auto insertion = std::lower_bound(selected.begin(), selected.end(), candidate, route_precedes);
         if (selected.size() == top_k && insertion == selected.end())
             continue;
@@ -101,8 +103,13 @@ static Result<void> dispatch_experts_general(std::span<const float> router_logit
     }
 
     const bool renormalize = options.normalization == RouterNormalization::SelectedExperts;
+    const bool softmax_topk = options.score_function == RouterScoreFunction::Softmax
+                              && renormalize
+                              && options.selection_bias.empty()
+                              && options.explicit_expert_ids.empty();
     std::vector<float>& scores = result.scores;
-    scores.reserve(options.expert_count);
+    if (!softmax_topk)
+        scores.reserve(options.expert_count);
     std::vector<RouteCandidate>& selected = result.selected;
     selected.reserve(static_cast<size_t>(options.top_k) + 1);
 
@@ -115,31 +122,45 @@ static Result<void> dispatch_experts_general(std::span<const float> router_logit
     for (uint32_t token_index = 0; token_index < token_count; ++token_index)
     {
         const float* logits = router_logits.data() + static_cast<size_t>(token_index) * options.expert_count;
-        router_scores(logits, options.expert_count, options.score_function, scores);
-        if (options.explicit_expert_ids.empty())
+        float selected_sum = 0.0f;
+        if (softmax_topk)
         {
-            select_topk_routes(scores.data(), options.selection_bias, options.expert_count, options.top_k, selected);
+            select_topk_routes(logits, options.selection_bias, options.expert_count, options.top_k, selected);
+            const float selected_maximum = selected.front().score;
+            for (RouteCandidate& candidate : selected)
+            {
+                candidate.score = float_approximate_exp(candidate.score - selected_maximum);
+                selected_sum += candidate.score;
+            }
         }
         else
         {
-            selected.clear();
-            for (uint32_t route_index = 0; route_index < options.top_k; ++route_index)
+            router_scores(logits, options.expert_count, options.score_function, scores);
+            if (options.explicit_expert_ids.empty())
             {
-                const uint32_t expert_id = options.explicit_expert_ids[static_cast<size_t>(token_index) * options.top_k + route_index];
-                if (expert_id >= options.expert_count)
-                    return Error{ErrorCode::InvalidArgument, "explicit expert id is out of range"};
-                selected.push_back({expert_id, scores[expert_id]});
+                select_topk_routes(scores.data(), options.selection_bias, options.expert_count, options.top_k, selected);
             }
+            else
+            {
+                selected.clear();
+                for (uint32_t route_index = 0; route_index < options.top_k; ++route_index)
+                {
+                    const uint32_t expert_id = options.explicit_expert_ids[static_cast<size_t>(token_index) * options.top_k + route_index];
+                    if (expert_id >= options.expert_count)
+                        return Error{ErrorCode::InvalidArgument, "explicit expert id is out of range"};
+                    selected.push_back({expert_id, scores[expert_id]});
+                }
+            }
+            for (const RouteCandidate& candidate : selected)
+                selected_sum += scores[candidate.expert_id];
         }
-        float selected_sum = 0.0f;
-        for (const RouteCandidate& candidate : selected)
-            selected_sum += scores[candidate.expert_id];
+
         if (renormalize && selected_sum <= 0.0f)
             return Error{ErrorCode::InvalidModel, "selected router weights have a non-positive sum"};
         for (uint32_t rank = 0; rank < selected.size(); ++rank)
         {
             const RouteCandidate& candidate = selected[rank];
-            const float score = scores[candidate.expert_id];
+            const float score = softmax_topk ? candidate.score : scores[candidate.expert_id];
             const float weight = (renormalize ? score / selected_sum : score) * options.routed_scaling_factor;
             result.route_scratch[candidate.expert_id].push_back({token_index, rank, weight});
         }
@@ -201,20 +222,28 @@ Result<void> forward_router(std::span<const float> router_logits,
     if (options.normalization != RouterNormalization::None && options.normalization != RouterNormalization::SelectedExperts)
         return Error{ErrorCode::InvalidArgument, "router normalization must be None or SelectedExperts"};
 
+    const bool renormalize = options.normalization == RouterNormalization::SelectedExperts;
+    const bool softmax_topk = options.score_function == RouterScoreFunction::Softmax
+                              && renormalize
+                              && options.selection_bias.empty()
+                              && options.explicit_expert_ids.empty();
     std::array<RouteCandidate, stack_top_k> selected{};
     uint32_t selected_count = 0;
     float maximum = -std::numeric_limits<float>::infinity();
-    for (float logit : router_logits)
+    if (!softmax_topk)
     {
-        if (!std::isfinite(logit))
+        for (float logit : router_logits)
         {
-            return Error{ErrorCode::InvalidArgument, "router logits must be finite"};
+            if (!std::isfinite(logit))
+            {
+                return Error{ErrorCode::InvalidArgument, "router logits must be finite"};
+            }
+            maximum = std::max(maximum, logit);
         }
-        maximum = std::max(maximum, logit);
     }
 
     float softmax_denominator = 1.0f;
-    if (options.score_function == RouterScoreFunction::Softmax)
+    if (options.score_function == RouterScoreFunction::Softmax && !softmax_topk)
     {
         softmax_denominator = 0.0f;
         for (float logit : router_logits)
@@ -251,11 +280,16 @@ Result<void> forward_router(std::span<const float> router_logits,
     {
         for (uint32_t expert_id = 0; expert_id < options.expert_count; ++expert_id)
         {
-            const float score = score_for_expert(expert_id);
+            const float logit = router_logits[expert_id];
+            if (softmax_topk && !std::isfinite(logit))
+                return Error{ErrorCode::InvalidArgument, "router logits must be finite"};
+            const float score = softmax_topk ? logit : score_for_expert(expert_id);
             const RouteCandidate candidate{
                 expert_id,
                 score + (options.selection_bias.empty() ? 0.0f : options.selection_bias[expert_id]),
             };
+            if (selected_count == options.top_k && route_precedes(selected[selected_count - 1], candidate))
+                continue;
             uint32_t insertion = 0;
             while (insertion < selected_count && route_precedes(selected[insertion], candidate))
             {
@@ -273,13 +307,18 @@ Result<void> forward_router(std::span<const float> router_logits,
         }
     }
 
-    if (options.explicit_expert_ids.empty() && !options.selection_bias.empty())
+    if (softmax_topk)
+    {
+        const float selected_maximum = selected[0].score;
+        for (uint32_t index = 0; index < selected_count; ++index)
+            selected[index].score = float_approximate_exp(selected[index].score - selected_maximum);
+    }
+    else if (options.explicit_expert_ids.empty() && !options.selection_bias.empty())
     {
         for (uint32_t index = 0; index < selected_count; ++index)
             selected[index].score = score_for_expert(selected[index].expert_id);
     }
 
-    const bool renormalize = options.normalization == RouterNormalization::SelectedExperts;
     float denominator = 0.0f;
     if (renormalize)
     {

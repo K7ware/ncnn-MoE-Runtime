@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <memory>
 #include <span>
 #include <vector>
@@ -83,15 +84,12 @@ void forward_embedding(const TensorData& embedding, std::span<const int32_t> inp
 [[nodiscard]] ActivationBuffer forward_linear(const TensorData& matrix, const ActivationBuffer& input, uint64_t optimization_flags, const CompiledOperator* op = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu);
 // A quantized input scratch, when supplied, must not alias input or output.
 void forward_linear(const TensorData& matrix, const ActivationBuffer& input, ActivationBuffer& output, uint64_t optimization_flags, const CompiledOperator* op = nullptr, ExecutionBackend backend = ExecutionBackend::Cpu, ActivationBuffer* quantized_input_scratch = nullptr);
-[[nodiscard]] bool forward_linear_pair(const TensorData& first,
-                                       const TensorData& second,
-                                       const ActivationBuffer& input,
-                                       ActivationBuffer& first_output,
-                                       ActivationBuffer& second_output,
-                                       uint64_t optimization_flags,
-                                       const CompiledOperator* first_op = nullptr,
-                                       const CompiledOperator* second_op = nullptr,
-                                       ActivationBuffer* quantized_input_scratch = nullptr);
+[[nodiscard]] bool forward_linear(std::initializer_list<const TensorData*> matrices,
+                                  const ActivationBuffer& input,
+                                  std::initializer_list<ActivationBuffer*> outputs,
+                                  uint64_t optimization_flags,
+                                  std::initializer_list<const CompiledOperator*> ops = {},
+                                  ActivationBuffer* quantized_input_scratch = nullptr);
 [[nodiscard]] bool forward_linear_rms_norm_float8(const TensorData& matrix,
                                                   const ActivationBuffer& input,
                                                   const TensorData& norm_weight,
@@ -116,7 +114,6 @@ void forward_gate_up_mxfp4(const TensorData& matrix, const TensorData* bias, con
 void forward_rms_norm(const ActivationBuffer& input, const TensorData& weight, float epsilon, ActivationBuffer& output, float weight_offset);
 void add_bias_inplace(ActivationBuffer& destination, const TensorData& bias);
 void add_batch_inplace(ActivationBuffer& destination, const ActivationBuffer& source);
-[[nodiscard]] std::vector<std::vector<float>> batch_to_vectors(const ActivationBuffer& batch);
 
 } // namespace moe
 } // namespace ncnn

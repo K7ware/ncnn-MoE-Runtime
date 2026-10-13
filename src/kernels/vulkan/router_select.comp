@@ -103,29 +103,34 @@ void main()
             selected[output_base + p.top_k * 2] = 1.0;
         return;
     }
-    float sum = 0.0;
-    for (uint expert = lane; expert < p.expert_count; expert += 128)
+    const bool raw_topk = p.score_function == 0 && p.normalize != 0
+                          && p.has_bias == 0 && p.has_explicit_ids == 0;
+    if (!raw_topk)
     {
-        const float logit = logits[input_base + expert];
-        const float score = p.score_function == 0 ? approximate_exp(logit - maximum)
-                            : p.score_function == 1
-                                ? 1.0 / (1.0 + approximate_exp(-logit))
-                                : sqrt(softplus(logit));
-        scores[expert] = score;
-        sum += score;
-    }
-    reduction[lane] = sum;
-    barrier();
-    for (uint stride = 64; stride != 0; stride /= 2)
-    {
-        if (lane < stride)
-            reduction[lane] += reduction[lane + stride];
-        barrier();
-    }
-    if (p.score_function == 0)
-    {
+        float sum = 0.0;
         for (uint expert = lane; expert < p.expert_count; expert += 128)
-            scores[expert] /= reduction[0];
+        {
+            const float logit = logits[input_base + expert];
+            const float score = p.score_function == 0 ? approximate_exp(logit - maximum)
+                                : p.score_function == 1
+                                    ? 1.0 / (1.0 + approximate_exp(-logit))
+                                    : sqrt(softplus(logit));
+            scores[expert] = score;
+            sum += score;
+        }
+        reduction[lane] = sum;
+        barrier();
+        for (uint stride = 64; stride != 0; stride /= 2)
+        {
+            if (lane < stride)
+                reduction[lane] += reduction[lane + stride];
+            barrier();
+        }
+        if (p.score_function == 0)
+        {
+            for (uint expert = lane; expert < p.expert_count; expert += 128)
+                scores[expert] /= reduction[0];
+        }
     }
     barrier();
     if (lane != 0)
@@ -143,7 +148,12 @@ void main()
     {
         for (uint expert = 0; expert < p.expert_count; ++expert)
         {
-            const float candidate = scores[expert] + (p.has_bias != 0 ? selection_bias[expert] : 0.0);
+            const float candidate = raw_topk ? logits[input_base + expert]
+                                             : scores[expert] + (p.has_bias != 0 ? selection_bias[expert] : 0.0);
+            if (count == p.top_k
+                && (candidate_scores[count - 1] > candidate
+                    || (candidate_scores[count - 1] == candidate && ids[count - 1] < expert)))
+                continue;
             uint insertion = 0;
             while (insertion < count && (candidate_scores[insertion] > candidate || (candidate_scores[insertion] == candidate && ids[insertion] < expert)))
                 ++insertion;
@@ -161,8 +171,21 @@ void main()
         }
     }
     float selected_sum = 0.0;
-    for (uint rank = 0; rank < p.top_k; ++rank)
-        selected_sum += scores[ids[rank]];
+    if (raw_topk)
+    {
+        const float selected_maximum = candidate_scores[0];
+        for (uint rank = 0; rank < p.top_k; ++rank)
+        {
+            const float score = approximate_exp(candidate_scores[rank] - selected_maximum);
+            scores[ids[rank]] = score;
+            selected_sum += score;
+        }
+    }
+    else
+    {
+        for (uint rank = 0; rank < p.top_k; ++rank)
+            selected_sum += scores[ids[rank]];
+    }
     if (p.normalize != 0 && selected_sum <= 0.0)
     {
         selected[output_base + p.top_k * 2] = 2.0;

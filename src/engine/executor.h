@@ -31,7 +31,8 @@ struct DecodeBatchEntry
     SessionStatistics* statistics = nullptr;
     SessionState* state = nullptr;
     uint64_t position_offset = 0;
-    bool output_logits = true;
+    // Distinct caller-owned outputs must remain valid during execution; null skips LM output.
+    std::vector<float>* logits = nullptr;
 };
 
 struct SpeculativeProposal
@@ -53,9 +54,9 @@ using SpeculativeSampler = std::function<Result<int32_t>(const std::vector<float
                                          uint64_t position_offset,
                                          LogitsOutput logits_output = LogitsOutput::All);
 
-[[nodiscard]] Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel& model,
-                                                                           std::span<const DecodeBatchEntry> entries,
-                                                                           BatchWorkspace& workspace);
+[[nodiscard]] Result<void> forward_decode_batch(const CompiledModel& model,
+                                                std::span<const DecodeBatchEntry> entries,
+                                                BatchWorkspace& workspace);
 
 [[nodiscard]] Result<void> update_speculative_context(const CompiledModel& model,
                                                       SessionStatistics& statistics,

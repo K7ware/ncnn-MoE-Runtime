@@ -80,13 +80,14 @@ static Result<void> add_vector_size(uint64_t count, uint64_t element_size, const
 static Result<uint64_t> latent_fp8_dense_size(const MoeModelDescriptor& descriptor)
 {
     uint64_t total = 0;
-    Result<void> status = add_matrix_size(descriptor.vocabulary_size, descriptor.hidden_size, DType::BFloat16, "DeepSeek embedding", total);
+    const uint64_t element_size = descriptor.activation_dtype == DType::BFloat16 ? 2 : 4;
+    Result<void> status = add_matrix_size(descriptor.vocabulary_size, descriptor.hidden_size, descriptor.activation_dtype, "DeepSeek embedding", total);
     if (!status)
         return status.error();
-    status = add_matrix_size(descriptor.vocabulary_size, descriptor.hidden_size, DType::BFloat16, "DeepSeek LM head", total);
+    status = add_matrix_size(descriptor.vocabulary_size, descriptor.hidden_size, descriptor.activation_dtype, "DeepSeek LM head", total);
     if (!status)
         return status.error();
-    status = add_vector_size(descriptor.hidden_size, 2, "DeepSeek final norm", total);
+    status = add_vector_size(descriptor.hidden_size, element_size, "DeepSeek final norm", total);
     if (!status)
         return status.error();
 
@@ -98,9 +99,62 @@ static Result<uint64_t> latent_fp8_dense_size(const MoeModelDescriptor& descript
     if (!status)
         return status.error();
 
-    for (uint32_t layer_id = 0; layer_id < descriptor.layers.size(); ++layer_id)
+    const bool has_dspark = descriptor.speculative_kind == SpeculativeModelKind::DSpark
+                            && descriptor.speculative_layer_count != 0;
+    if (has_dspark)
     {
-        const LayerDescriptor& layer = descriptor.layers[layer_id];
+        auto projection_columns = checked_multiply(descriptor.hidden_size,
+                                                   descriptor.speculative_target_layer_ids.size(),
+                                                   "DeepSeek speculative main projection");
+        if (!projection_columns)
+            return projection_columns.error();
+        status = add_matrix_size(descriptor.hidden_size, projection_columns.value(), DType::Float8E4M3,
+                                 "DeepSeek speculative main projection", total);
+        if (!status)
+            return status.error();
+        status = add_vector_size(static_cast<uint64_t>(descriptor.hidden_size) * 2,
+                                 element_size, "DeepSeek speculative norms", total);
+        if (!status)
+            return status.error();
+        auto hyper_columns = checked_multiply(multiplier, descriptor.hidden_size,
+                                              "DeepSeek speculative hyper head");
+        if (!hyper_columns)
+            return hyper_columns.error();
+        status = add_matrix_size(multiplier, hyper_columns.value(), DType::Float32,
+                                 "DeepSeek speculative hyper head", total);
+        if (!status)
+            return status.error();
+        status = add_vector_size(multiplier + 1, 4, "DeepSeek speculative hyper head parameters", total);
+        if (!status)
+            return status.error();
+        status = add_matrix_size(descriptor.vocabulary_size, descriptor.speculative_markov_rank,
+                                 descriptor.activation_dtype, "DeepSeek speculative Markov embedding", total);
+        if (!status)
+            return status.error();
+        status = add_matrix_size(descriptor.vocabulary_size, descriptor.speculative_markov_rank,
+                                 descriptor.activation_dtype, "DeepSeek speculative Markov head", total);
+        if (!status)
+            return status.error();
+        auto confidence_columns = checked_add(descriptor.hidden_size, descriptor.speculative_markov_rank,
+                                              "DeepSeek speculative confidence");
+        if (!confidence_columns)
+            return confidence_columns.error();
+        status = add_matrix_size(1, confidence_columns.value(), descriptor.activation_dtype,
+                                 "DeepSeek speculative confidence", total);
+        if (!status)
+            return status.error();
+    }
+
+    const uint64_t main_layer_count = descriptor.layers.size();
+    auto layer_count = checked_add(main_layer_count,
+                                   has_dspark ? descriptor.speculative_layer_count : 0,
+                                   "DeepSeek layer count");
+    if (!layer_count)
+        return layer_count.error();
+    for (uint64_t layer_id = 0; layer_id < layer_count.value(); ++layer_id)
+    {
+        const bool draft = layer_id >= main_layer_count;
+        const LayerDescriptor& layer = descriptor.layers[std::min(layer_id, main_layer_count - 1)];
         const AttentionDescriptor& attention = layer.attention;
         const MoeDescriptor& moe = layer.moe;
         if (attention.kind != AttentionKind::MultiHeadLatent
@@ -120,7 +174,7 @@ static Result<uint64_t> latent_fp8_dense_size(const MoeModelDescriptor& descript
             if (!status)
                 return status.error();
         }
-        status = add_vector_size(descriptor.hidden_size * 2ull, 2, "DeepSeek layer norms", total);
+        status = add_vector_size(descriptor.hidden_size * 2ull, element_size, "DeepSeek layer norms", total);
         if (!status)
             return status.error();
 
@@ -140,34 +194,39 @@ static Result<uint64_t> latent_fp8_dense_size(const MoeModelDescriptor& descript
         status = add_matrix_size(descriptor.hidden_size, static_cast<uint64_t>(attention.output_group_count) * attention.output_lora_rank, attention.projection_weight_dtype, "DeepSeek output B", total);
         if (!status)
             return status.error();
-        status = add_vector_size(attention.query_lora_rank + attention.head_dimension, 2, "DeepSeek attention norms", total);
+        status = add_vector_size(attention.query_lora_rank + attention.head_dimension, element_size,
+                                 "DeepSeek attention norms", total);
         if (!status)
             return status.error();
         status = add_vector_size(attention.head_count, 4, "DeepSeek attention sinks", total);
         if (!status)
             return status.error();
 
-        if (attention.compression_ratio != 0)
+        if (!draft && attention.compression_ratio != 0)
         {
             const uint64_t compressor_multiplier = attention.compression_ratio == 4 ? 2 : 1;
-            status = add_matrix_size(compressor_multiplier * attention.head_dimension, descriptor.hidden_size, DType::BFloat16, "DeepSeek compressor KV", total);
+            status = add_matrix_size(compressor_multiplier * attention.head_dimension, descriptor.hidden_size,
+                                     descriptor.activation_dtype, "DeepSeek compressor KV", total);
             if (!status)
                 return status.error();
-            status = add_matrix_size(compressor_multiplier * attention.head_dimension, descriptor.hidden_size, DType::BFloat16, "DeepSeek compressor gate", total);
+            status = add_matrix_size(compressor_multiplier * attention.head_dimension, descriptor.hidden_size,
+                                     descriptor.activation_dtype, "DeepSeek compressor gate", total);
             if (!status)
                 return status.error();
             status = add_matrix_size(attention.compression_ratio, compressor_multiplier * attention.head_dimension, DType::Float32, "DeepSeek compressor position", total);
             if (!status)
                 return status.error();
-            status = add_vector_size(attention.head_dimension, 2, "DeepSeek compressor norm", total);
+            status = add_vector_size(attention.head_dimension, element_size, "DeepSeek compressor norm", total);
             if (!status)
                 return status.error();
             if (attention.compression_ratio == 4)
             {
-                status = add_matrix_size(2ull * attention.index_head_dimension, descriptor.hidden_size, DType::BFloat16, "DeepSeek index compressor KV", total);
+                status = add_matrix_size(2ull * attention.index_head_dimension, descriptor.hidden_size,
+                                         descriptor.activation_dtype, "DeepSeek index compressor KV", total);
                 if (!status)
                     return status.error();
-                status = add_matrix_size(2ull * attention.index_head_dimension, descriptor.hidden_size, DType::BFloat16, "DeepSeek index compressor gate", total);
+                status = add_matrix_size(2ull * attention.index_head_dimension, descriptor.hidden_size,
+                                         descriptor.activation_dtype, "DeepSeek index compressor gate", total);
                 if (!status)
                     return status.error();
                 status = add_matrix_size(attention.compression_ratio, 2ull * attention.index_head_dimension, DType::Float32, "DeepSeek index compressor position", total);
@@ -176,33 +235,50 @@ static Result<uint64_t> latent_fp8_dense_size(const MoeModelDescriptor& descript
                 status = add_matrix_size(static_cast<uint64_t>(attention.index_head_count) * attention.index_head_dimension, attention.query_lora_rank, attention.projection_weight_dtype, "DeepSeek index query", total);
                 if (!status)
                     return status.error();
-                status = add_matrix_size(attention.index_head_count, descriptor.hidden_size, DType::BFloat16, "DeepSeek index weights", total);
+                status = add_matrix_size(attention.index_head_count, descriptor.hidden_size,
+                                         descriptor.activation_dtype, "DeepSeek index weights", total);
                 if (!status)
                     return status.error();
-                status = add_vector_size(attention.index_head_dimension, 2, "DeepSeek index norm", total);
+                status = add_vector_size(attention.index_head_dimension, element_size,
+                                         "DeepSeek index norm", total);
                 if (!status)
                     return status.error();
             }
         }
 
-        status = add_matrix_size(moe.expert_count, descriptor.hidden_size, DType::BFloat16, "DeepSeek router", total);
+        status = add_matrix_size(moe.expert_count, descriptor.hidden_size, descriptor.activation_dtype,
+                                 "DeepSeek router", total);
         if (!status)
             return status.error();
-        if (layer_id < descriptor.hash_routing_layer_count)
+        if (!draft && layer_id < descriptor.hash_routing_layer_count)
             status = add_matrix_size(descriptor.vocabulary_size, moe.top_k, DType::Int64, "DeepSeek hash router", total);
         else
             status = add_vector_size(moe.expert_count, 4, "DeepSeek router bias", total);
         if (!status)
             return status.error();
-        status = add_matrix_size(moe.intermediate_size, descriptor.hidden_size, moe.shared_expert_weight_dtype, "DeepSeek shared Expert input", total);
-        if (!status)
-            return status.error();
-        status = add_matrix_size(moe.intermediate_size, descriptor.hidden_size, moe.shared_expert_weight_dtype, "DeepSeek shared Expert input", total);
-        if (!status)
-            return status.error();
-        status = add_matrix_size(descriptor.hidden_size, moe.intermediate_size, moe.shared_expert_weight_dtype, "DeepSeek shared Expert output", total);
-        if (!status)
-            return status.error();
+        if (draft || moe.shared_expert_count != 0)
+        {
+            status = add_matrix_size(moe.intermediate_size, descriptor.hidden_size, moe.shared_expert_weight_dtype,
+                                     "DeepSeek shared Expert input", total);
+            if (!status)
+                return status.error();
+            status = add_matrix_size(moe.intermediate_size, descriptor.hidden_size, moe.shared_expert_weight_dtype,
+                                     "DeepSeek shared Expert input", total);
+            if (!status)
+                return status.error();
+            status = add_matrix_size(descriptor.hidden_size, moe.intermediate_size, moe.shared_expert_weight_dtype,
+                                     "DeepSeek shared Expert output", total);
+            if (!status)
+                return status.error();
+        }
+        if (!draft && moe.shared_expert_count != 0
+            && has_flag(moe.flags, MoeDescriptorSharedExpertGate))
+        {
+            status = add_vector_size(descriptor.hidden_size, element_size,
+                                     "DeepSeek shared Expert router gate", total);
+            if (!status)
+                return status.error();
+        }
     }
     return total;
 }
@@ -295,11 +371,13 @@ static Result<uint64_t> latent_vulkan_releasable_dense_size(const MoeModelDescri
 
 static Result<uint64_t> dense_size(const MoeModelDescriptor& descriptor)
 {
-    if (!descriptor.layers.empty()
-        && descriptor.hyper_connection_multiplier > 1
-        && descriptor.layers.front().attention.kind == AttentionKind::MultiHeadLatent
-        && descriptor.layers.front().attention.projection_weight_dtype == DType::Float8E4M3)
+    const bool latent_fp8 = !descriptor.layers.empty()
+                            && descriptor.hyper_connection_multiplier > 1
+                            && descriptor.layers.front().attention.kind == AttentionKind::MultiHeadLatent
+                            && descriptor.layers.front().attention.projection_weight_dtype == DType::Float8E4M3;
+    if (latent_fp8)
         return latent_fp8_dense_size(descriptor);
+
     const uint64_t element_size = descriptor.activation_dtype == DType::BFloat16 ? 2 : 4;
     auto embedding_elements = checked_multiply(descriptor.vocabulary_size, descriptor.hidden_size, "embedding");
     if (!embedding_elements)
@@ -579,9 +657,10 @@ static Result<uint64_t> dense_size(const MoeModelDescriptor& descriptor)
         {
             return Error{ErrorCode::InvalidModel, "invalid MTP dense-memory configuration"};
         }
-        const LayerDescriptor& layer = descriptor.layers.back();
-        const AttentionDescriptor& attention = layer.attention;
-        const MoeDescriptor& moe = layer.moe;
+        LayerDescriptor draft = descriptor.layers.back();
+        draft.attention.flags &= ~AttentionDescriptorQsa;
+        const AttentionDescriptor& attention = draft.attention;
+        const MoeDescriptor& moe = draft.moe;
         const uint64_t query_size = static_cast<uint64_t>(attention.head_count) * attention.head_dimension;
         const uint64_t key_value_size = static_cast<uint64_t>(attention.kv_head_count) * attention.head_dimension;
         uint64_t mtp_elements = 0;
@@ -672,7 +751,10 @@ static Result<uint64_t> dense_size(const MoeModelDescriptor& descriptor)
     auto final_norm = checked_multiply(final_norm_elements, element_size, "final norm");
     if (!final_norm)
         return final_norm.error();
-    return checked_add(total, final_norm.value(), "dense weights");
+    auto dense_total = checked_add(total, final_norm.value(), "dense weights");
+    if (!dense_total)
+        return dense_total.error();
+    return dense_total.value();
 }
 
 static Result<uint64_t> mxfp4_pair_size(const MoeModelDescriptor& descriptor)
@@ -747,8 +829,10 @@ static Result<uint64_t> packed_matrix_storage_size(uint64_t rows,
     return uint64_t{0};
 }
 
-static Result<uint64_t> packed_expert_pair_size(const MoeModelDescriptor& descriptor, DType dtype)
+static Result<uint64_t> packed_expert_pair_size(const MoeModelDescriptor& descriptor,
+                                                const MoeDescriptor& moe)
 {
+    const DType dtype = moe.expert_weight_dtype;
     auto gate_up = packed_matrix_storage_size(static_cast<uint64_t>(descriptor.intermediate_size) * 2,
                                               descriptor.hidden_size,
                                               dtype,
@@ -819,43 +903,74 @@ Result<ModelMemoryPlan> plan_model_memory(const MoeModelDescriptor& descriptor, 
 
     if (descriptor.layers.empty())
         return Error{ErrorCode::InvalidModel, "memory planner requires at least one layer"};
-    uint64_t moe_layer_count = static_cast<uint64_t>(descriptor.layers.size());
-    moe_layer_count += descriptor.speculative_layer_count;
     const MoeDescriptor& moe = descriptor.layers.front().moe;
-    auto pair_size = expert_pair_size(descriptor, moe.expert_weight_dtype);
-    if (!pair_size)
-        return pair_size.error();
-    plan.expert_pair_size = pair_size.value();
-    plan.expert_pair_resident_size = plan.expert_pair_size;
-    if (reserve_cpu_packed_weights)
-    {
-        auto packed_pair_size = packed_expert_pair_size(descriptor, moe.expert_weight_dtype);
-        if (!packed_pair_size)
-            return packed_pair_size.error();
-        auto resident_pair_size = checked_add(plan.expert_pair_size,
-                                              packed_pair_size.value(),
+    const auto add_expert_layers = [&](const MoeDescriptor& layer_moe,
+                                       uint64_t layer_count) -> Result<void> {
+        auto pair_size = expert_pair_size(descriptor, layer_moe.expert_weight_dtype);
+        if (!pair_size)
+            return pair_size.error();
+        uint64_t packed_pair_size = 0;
+        if (reserve_cpu_packed_weights)
+        {
+            auto packed_size = packed_expert_pair_size(descriptor, layer_moe);
+            if (!packed_size)
+                return packed_size.error();
+            packed_pair_size = packed_size.value();
+        }
+        auto resident_pair_size = checked_add(pair_size.value(), packed_pair_size,
                                               "resident expert pair");
         if (!resident_pair_size)
             return resident_pair_size.error();
-        plan.expert_pair_resident_size = resident_pair_size.value();
+
+        plan.expert_pair_size = std::max(plan.expert_pair_size, pair_size.value());
+        plan.expert_pair_resident_size = std::max(plan.expert_pair_resident_size,
+                                                  resident_pair_size.value());
+
+        auto pair_count = checked_multiply(layer_count, descriptor.expert_count,
+                                           "expert count");
+        if (!pair_count)
+            return pair_count.error();
+        auto expert_size = checked_multiply(pair_size.value(), pair_count.value(),
+                                            "expert weights");
+        if (!expert_size)
+            return expert_size.error();
+        auto total_expert_size = checked_add(plan.estimated_expert_size,
+                                             expert_size.value(), "expert weights");
+        if (!total_expert_size)
+            return total_expert_size.error();
+        plan.estimated_expert_size = total_expert_size.value();
+
+        auto packed_expert_size = checked_multiply(packed_pair_size, pair_count.value(),
+                                                   "packed expert weights");
+        if (!packed_expert_size)
+            return packed_expert_size.error();
+        auto total_packed_expert_size = checked_add(plan.estimated_cpu_packed_expert_size,
+                                                    packed_expert_size.value(),
+                                                    "packed expert weights");
+        if (!total_packed_expert_size)
+            return total_packed_expert_size.error();
+        plan.estimated_cpu_packed_expert_size = total_packed_expert_size.value();
+        return {};
+    };
+    for (const LayerDescriptor& layer : descriptor.layers)
+    {
+        auto status = add_expert_layers(layer.moe, 1);
+        if (!status)
+            return status.error();
+    }
+    if (descriptor.speculative_layer_count != 0)
+    {
+        // MTP and D-Spark bind speculative gate/up weights as one 2I x H matrix.
+        MoeDescriptor speculative_moe = descriptor.layers.back().moe;
+        speculative_moe.layout = ExpertLayout::PackedGateUpDown;
+        auto status = add_expert_layers(speculative_moe, descriptor.speculative_layer_count);
+        if (!status)
+            return status.error();
     }
     auto active_size = checked_multiply(plan.expert_pair_resident_size, moe.top_k, "active experts");
     if (!active_size)
         return active_size.error();
     plan.minimum_active_expert_size = active_size.value();
-    auto expert_count = checked_multiply(moe_layer_count, descriptor.expert_count, "expert count");
-    if (!expert_count)
-        return expert_count.error();
-    auto expert_size = checked_multiply(plan.expert_pair_size, expert_count.value(), "expert weights");
-    if (!expert_size)
-        return expert_size.error();
-    plan.estimated_expert_size = expert_size.value();
-    auto packed_expert_size = checked_multiply(plan.expert_pair_resident_size - plan.expert_pair_size,
-                                               expert_count.value(),
-                                               "packed expert weights");
-    if (!packed_expert_size)
-        return packed_expert_size.error();
-    plan.estimated_cpu_packed_expert_size = packed_expert_size.value();
     auto resident_expert_size = checked_add(plan.estimated_expert_size,
                                             plan.estimated_cpu_packed_expert_size,
                                             "resident expert weights");

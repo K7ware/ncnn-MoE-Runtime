@@ -190,7 +190,7 @@ static void hyper_test_numerical(uint32_t copies, uint32_t hidden_size, uint32_t
         HyperConnectionWorkspace_vulkan abandoned_work;
         HyperConnectionWorkspace_vulkan abandoned_head_work;
         // Keep tensors alive until the unsubmitted recorder is destroyed.
-        ncnn::VkCompute abandoned(context->device(), context->command_optimization_flags());
+        ncnn::VkCompute abandoned(context->device());
         abandoned.record_clone(input_host, abandoned_input, op->option());
         abandoned.record_clone(branch_host, abandoned_branch, op->option());
         hyper_check(op->record_pre(abandoned_input, abandoned_mix, abandoned_work, abandoned), label + " abandoned pre");
@@ -199,7 +199,7 @@ static void hyper_test_numerical(uint32_t copies, uint32_t hidden_size, uint32_t
     }
     hyper_check(get_vulkan_statistics(runtime).compute_submissions == submissions, label + " abandoned command never submits");
     // Reuse exactly the same operators in a new recorder and the existing CPU parity assertions.
-    ncnn::VkCompute cmd(context->device(), context->command_optimization_flags());
+    ncnn::VkCompute cmd(context->device());
     cmd.record_clone(input_host, input_device, op->option());
     cmd.record_clone(branch_host, branch_device, op->option());
     hyper_check(op->record_pre(input_device, mix, workspace, cmd), "record pre");
@@ -280,7 +280,7 @@ static void hyper_test_device_chain()
     const ncnn::Mat input_host = hyper_host(input);
     ncnn::Mat output_host;
     const std::lock_guard<std::mutex> lock(context->command_mutex());
-    ncnn::VkCompute cmd(context->device(), context->command_optimization_flags());
+    ncnn::VkCompute cmd(context->device());
     const uint64_t submissions = get_vulkan_statistics(runtime).compute_submissions;
     cmd.record_clone(input_host, input_device, first->option());
     hyper_check(first->record_pre(input_device, first_mix, first_workspace, cmd), "chain first pre");
@@ -349,7 +349,7 @@ static void hyper_test_layer_head(DType dtype, uint32_t rows)
     else if (dtype == DType::BFloat16)
         compiled.bfloat16 = Bfloat16Linear_vulkan::create(lm_weight, nullptr, 0, runtime, OptimizationDefaultFlags);
     else
-        compiled.linear = Linear::create(lm_weight, nullptr, LinearDevice::Vulkan, 0, runtime, OptimizationDefaultFlags);
+        compiled.linear = Linear::create(lm_weight, nullptr, 0, runtime, OptimizationDefaultFlags);
     ActivationBuffer expected;
     bool projected = false;
     if (compiled.float8)
@@ -386,7 +386,7 @@ static void hyper_test_layer_head(DType dtype, uint32_t rows)
     ncnn::Mat reused_host;
     const std::lock_guard<std::mutex> lock(context->command_mutex());
     const uint64_t submissions = get_vulkan_statistics(runtime).compute_submissions;
-    ncnn::VkCompute cmd(context->device(), context->command_optimization_flags());
+    ncnn::VkCompute cmd(context->device());
     cmd.record_clone(input_host, input_device, op->option());
     hyper_check(op->record(input_device, logits, hc_workspace, temporaries, cmd), "record LayerHead");
     hyper_check(temporaries.size() == (dtype == DType::Float8E4M3 ? 3u : 2u), "HC/RMS/LM device stages recorded");
@@ -425,7 +425,7 @@ static void hyper_test_rejection()
     HyperConnectionMix_vulkan mix;
     HyperConnectionWorkspace_vulkan workspace;
     const std::lock_guard<std::mutex> lock(context->command_mutex());
-    ncnn::VkCompute cmd(context->device(), context->command_optimization_flags());
+    ncnn::VkCompute cmd(context->device());
     cmd.record_clone(input_host, input_device, op->option());
     hyper_check(op->record_pre(input_device, mix, workspace, cmd), "valid pre before rejections");
     const ncnn::VkBufferMemory* preserved_reduced = mix.reduced.data;

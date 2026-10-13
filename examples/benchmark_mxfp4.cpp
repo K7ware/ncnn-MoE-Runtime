@@ -812,7 +812,6 @@ int main(int argc, char** argv)
         }
         auto bfloat16_vulkan = ncnn::moe::Linear::create(bfloat16_matrix,
                                                          nullptr,
-                                                         ncnn::moe::LinearDevice::Vulkan,
                                                          device_index,
                                                          vulkan_runtime,
                                                          optimization_flags);

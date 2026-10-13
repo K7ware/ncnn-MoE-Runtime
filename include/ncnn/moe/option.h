@@ -33,48 +33,42 @@ enum OptionFlag : uint32_t
 
 // Algorithm and backend choices use a separate bitmap from storage policy.
 // Normalization, GatedDelta and row/group scheduling are automatic. Retired
-// bits 0, 2, 11, 13 and 15 stay unused so remaining flag values do not change.
-#define NCNN_MOE_OPT_CPU_FAST_SILU_BIT                   1
-#define NCNN_MOE_OPT_CPU_FLOAT8_FUSED_GATE_UP_BIT        3
-#define NCNN_MOE_OPT_CPU_FLOAT8_BF16_DOT_BIT             4
-#define NCNN_MOE_OPT_CPU_FLOAT8_BATCH_TILE_BIT           5
-#define NCNN_MOE_OPT_CPU_FLOAT8_SIMD_QUANTIZE_BIT        6
-#define NCNN_MOE_OPT_CPU_FLOAT8_FUSED_PROJECTIONS_BIT    7
-#define NCNN_MOE_OPT_CPU_BFLOAT16_BATCHED_BIT            8
-#define NCNN_MOE_OPT_CPU_ROPE_CACHE_BIT                  9
-#define NCNN_MOE_OPT_CPU_BF16_DIRECT_ATTENTION_BIT       10
-#define NCNN_MOE_OPT_CPU_LATENT_PREPARED_ROPE_BIT        12
-#define NCNN_MOE_OPT_CPU_LATENT_ONLINE_SOFTMAX_BIT       14
-#define NCNN_MOE_OPT_NCNN_CPU_BFLOAT16_LINEAR_BIT        16
-#define NCNN_MOE_OPT_VULKAN_BFLOAT16_COOP_MATRIX_BIT     17
-#define NCNN_MOE_OPT_VULKAN_ATTENTION_BIT                18
-#define NCNN_MOE_OPT_VULKAN_ATTENTION_BATCH_BIT          19
-#define NCNN_MOE_OPT_VULKAN_KV_PROMOTION_BIT             20
-#define NCNN_MOE_OPT_VULKAN_DEVICE_ROPE_BIT              21
-#define NCNN_MOE_OPT_VULKAN_DECODE_SDPA_BIT              22
-#define NCNN_MOE_OPT_VULKAN_QKV_RING_BIT                 23
-#define NCNN_MOE_OPT_VULKAN_ROUTE_AGGREGATION_BIT        24
-#define NCNN_MOE_OPT_VULKAN_EXPERT_BATCH_ADMISSION_BIT   25
-#define NCNN_MOE_OPT_VULKAN_EXPERT_EAGER_ADMISSION_BIT   26
-#define NCNN_MOE_OPT_VULKAN_LATENT_COMPRESSOR_BIT        27
-#define NCNN_MOE_OPT_VULKAN_PIPELINE_BIND_ELISION_BIT    28
-#define NCNN_MOE_OPT_VULKAN_READONLY_BINDINGS_BIT        29
-#define NCNN_MOE_OPT_VULKAN_BATCH_BUFFER_BARRIERS_BIT    30
-#define NCNN_MOE_OPT_VULKAN_STACK_DESCRIPTOR_PAYLOAD_BIT 31
-#define NCNN_MOE_OPT_VULKAN_COMMAND_GRAPH_BIT            32
-#define NCNN_MOE_OPT_CPU_LATENT_VECTOR_SOFTMAX_BIT       33
-#define NCNN_MOE_OPT_VULKAN_LATENT_INPUT_RMS_NORM_BIT    34
-#define NCNN_MOE_OPT_VULKAN_EXPERT_GPU_PRIORITY_BIT      35
-#define NCNN_MOE_OPT_CPU_MXFP4_Q8_BIT                    36
-#define NCNN_MOE_OPT_CPU_FLASH_ATTENTION_BIT             37
-#define NCNN_MOE_OPT_CPU_SPLIT_KV_ATTENTION_BIT          38
-#define NCNN_MOE_OPT_VULKAN_INDEXED_EXPERTS_BIT          39
-#define NCNN_MOE_OPT_VULKAN_QNK_BIT                      40
-#define NCNN_MOE_OPT_CPU_PACKED_WEIGHTS_BIT              41
-#define NCNN_MOE_OPT_VULKAN_JOINT_CACHE_EVICTION_BIT     42
-#define NCNN_MOE_OPT_VULKAN_MXFP4_ROW_TILE_BIT           43
-#define NCNN_MOE_OPT_VULKAN_EXPERT_DIRECT_STAGING_BIT    44
-#define NCNN_MOE_OPT_VULKAN_SHARED_EXPERT_OVERLAP_BIT    45
+// bits 0, 2, 9, 11, 13, 15, 16, 26 and 28-31 stay unused so remaining flag
+// values do not change.
+#define NCNN_MOE_OPT_CPU_FAST_SILU_BIT                 1
+#define NCNN_MOE_OPT_CPU_FLOAT8_FUSED_GATE_UP_BIT      3
+#define NCNN_MOE_OPT_CPU_FLOAT8_BF16_DOT_BIT           4
+#define NCNN_MOE_OPT_CPU_FLOAT8_BATCH_TILE_BIT         5
+#define NCNN_MOE_OPT_CPU_FLOAT8_SIMD_QUANTIZE_BIT      6
+#define NCNN_MOE_OPT_CPU_FLOAT8_FUSED_PROJECTIONS_BIT  7
+#define NCNN_MOE_OPT_CPU_BFLOAT16_BATCHED_BIT          8
+#define NCNN_MOE_OPT_CPU_BF16_DIRECT_ATTENTION_BIT     10
+#define NCNN_MOE_OPT_CPU_LATENT_PREPARED_ROPE_BIT      12
+#define NCNN_MOE_OPT_CPU_LATENT_ONLINE_SOFTMAX_BIT     14
+#define NCNN_MOE_OPT_VULKAN_BFLOAT16_COOP_MATRIX_BIT   17
+#define NCNN_MOE_OPT_VULKAN_ATTENTION_BIT              18
+#define NCNN_MOE_OPT_VULKAN_ATTENTION_BATCH_BIT        19
+#define NCNN_MOE_OPT_VULKAN_KV_PROMOTION_BIT           20
+#define NCNN_MOE_OPT_VULKAN_DEVICE_ROPE_BIT            21
+#define NCNN_MOE_OPT_VULKAN_DECODE_SDPA_BIT            22
+#define NCNN_MOE_OPT_VULKAN_QKV_RING_BIT               23
+#define NCNN_MOE_OPT_VULKAN_ROUTE_AGGREGATION_BIT      24
+#define NCNN_MOE_OPT_VULKAN_EXPERT_BATCH_ADMISSION_BIT 25
+#define NCNN_MOE_OPT_VULKAN_LATENT_COMPRESSOR_BIT      27
+#define NCNN_MOE_OPT_VULKAN_COMMAND_GRAPH_BIT          32
+#define NCNN_MOE_OPT_CPU_LATENT_VECTOR_SOFTMAX_BIT     33
+#define NCNN_MOE_OPT_VULKAN_LATENT_INPUT_RMS_NORM_BIT  34
+#define NCNN_MOE_OPT_VULKAN_EXPERT_GPU_PRIORITY_BIT    35
+#define NCNN_MOE_OPT_CPU_MXFP4_Q8_BIT                  36
+#define NCNN_MOE_OPT_CPU_FLASH_ATTENTION_BIT           37
+#define NCNN_MOE_OPT_CPU_SPLIT_KV_ATTENTION_BIT        38
+#define NCNN_MOE_OPT_VULKAN_INDEXED_EXPERTS_BIT        39
+#define NCNN_MOE_OPT_VULKAN_QNK_BIT                    40
+#define NCNN_MOE_OPT_CPU_PACKED_WEIGHTS_BIT            41
+#define NCNN_MOE_OPT_VULKAN_JOINT_CACHE_EVICTION_BIT   42
+#define NCNN_MOE_OPT_VULKAN_MXFP4_ROW_TILE_BIT         43
+#define NCNN_MOE_OPT_VULKAN_EXPERT_DIRECT_STAGING_BIT  44
+#define NCNN_MOE_OPT_VULKAN_SHARED_EXPERT_OVERLAP_BIT  45
 
 enum OptimizationFlag : uint64_t
 {
@@ -85,11 +79,9 @@ enum OptimizationFlag : uint64_t
     OptimizationCpuFloat8SimdQuantize = UINT64_C(1) << NCNN_MOE_OPT_CPU_FLOAT8_SIMD_QUANTIZE_BIT,
     OptimizationCpuFloat8FusedProjections = UINT64_C(1) << NCNN_MOE_OPT_CPU_FLOAT8_FUSED_PROJECTIONS_BIT,
     OptimizationCpuBfloat16Batched = UINT64_C(1) << NCNN_MOE_OPT_CPU_BFLOAT16_BATCHED_BIT,
-    OptimizationCpuRopeCache = UINT64_C(1) << NCNN_MOE_OPT_CPU_ROPE_CACHE_BIT,
     OptimizationCpuBf16DirectAttention = UINT64_C(1) << NCNN_MOE_OPT_CPU_BF16_DIRECT_ATTENTION_BIT,
     OptimizationCpuLatentPreparedRope = UINT64_C(1) << NCNN_MOE_OPT_CPU_LATENT_PREPARED_ROPE_BIT,
     OptimizationCpuLatentOnlineSoftmax = UINT64_C(1) << NCNN_MOE_OPT_CPU_LATENT_ONLINE_SOFTMAX_BIT,
-    OptimizationNcnnCpuBfloat16Linear = UINT64_C(1) << NCNN_MOE_OPT_NCNN_CPU_BFLOAT16_LINEAR_BIT,
     OptimizationVulkanBfloat16CoopMatrix = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_BFLOAT16_COOP_MATRIX_BIT,
     OptimizationVulkanAttention = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_ATTENTION_BIT,
     OptimizationVulkanAttentionBatch = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_ATTENTION_BATCH_BIT,
@@ -99,12 +91,7 @@ enum OptimizationFlag : uint64_t
     OptimizationVulkanQkvRing = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_QKV_RING_BIT,
     OptimizationVulkanRouteAggregation = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_ROUTE_AGGREGATION_BIT,
     OptimizationVulkanExpertBatchAdmission = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_EXPERT_BATCH_ADMISSION_BIT,
-    OptimizationVulkanExpertEagerAdmission = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_EXPERT_EAGER_ADMISSION_BIT,
     OptimizationVulkanLatentCompressor = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_LATENT_COMPRESSOR_BIT,
-    OptimizationVulkanPipelineBindElision = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_PIPELINE_BIND_ELISION_BIT,
-    OptimizationVulkanReadonlyBindings = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_READONLY_BINDINGS_BIT,
-    OptimizationVulkanBatchBufferBarriers = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_BATCH_BUFFER_BARRIERS_BIT,
-    OptimizationVulkanStackDescriptorPayload = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_STACK_DESCRIPTOR_PAYLOAD_BIT,
     OptimizationVulkanCommandGraph = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_COMMAND_GRAPH_BIT,
     OptimizationCpuLatentVectorSoftmax = UINT64_C(1) << NCNN_MOE_OPT_CPU_LATENT_VECTOR_SOFTMAX_BIT,
     OptimizationVulkanLatentInputRmsNorm = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_LATENT_INPUT_RMS_NORM_BIT,
@@ -130,14 +117,12 @@ inline constexpr uint64_t OptimizationDefaultFlags = OptimizationCpuFastSilu
                                                      | OptimizationCpuFloat8SimdQuantize
                                                      | OptimizationCpuFloat8FusedProjections
                                                      | OptimizationCpuBfloat16Batched
-                                                     | OptimizationCpuRopeCache
                                                      | OptimizationCpuBf16DirectAttention
                                                      | OptimizationCpuFlashAttention
                                                      | OptimizationCpuSplitKvAttention
                                                      | OptimizationCpuLatentPreparedRope
                                                      | OptimizationCpuLatentOnlineSoftmax
                                                      | OptimizationCpuMxfp4Q8
-                                                     | OptimizationNcnnCpuBfloat16Linear
                                                      | OptimizationVulkanBfloat16CoopMatrix
                                                      | OptimizationVulkanAttention
                                                      | OptimizationVulkanAttentionBatch
@@ -147,12 +132,7 @@ inline constexpr uint64_t OptimizationDefaultFlags = OptimizationCpuFastSilu
                                                      | OptimizationVulkanQkvRing
                                                      | OptimizationVulkanRouteAggregation
                                                      | OptimizationVulkanExpertBatchAdmission
-                                                     | OptimizationVulkanExpertEagerAdmission
                                                      | OptimizationVulkanLatentCompressor
-                                                     | OptimizationVulkanPipelineBindElision
-                                                     | OptimizationVulkanReadonlyBindings
-                                                     | OptimizationVulkanBatchBufferBarriers
-                                                     | OptimizationVulkanStackDescriptorPayload
                                                      | OptimizationVulkanCommandGraph
                                                      | OptimizationCpuLatentVectorSoftmax
                                                      | OptimizationVulkanLatentInputRmsNorm

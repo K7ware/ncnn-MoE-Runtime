@@ -179,23 +179,17 @@ Result<std::vector<PrefillResult>> BatchSchedulerPrivate::prefill(std::span<Sess
                 &session.stats_scratch,
                 session.state.get(),
                 session.token_count + token_index,
-                token_index + 1 == requests[session_index].input_ids.size(),
+                token_index + 1 == requests[session_index].input_ids.size()
+                    ? &results[session_index].logits
+                    : nullptr,
             });
         }
 
-        auto logits = forward_decode_batch(compiled,
-                                           entries,
-                                           workspace);
-        if (!logits)
-            return logits.error();
-        if (logits.value().size() != entries.size())
-        {
-            return Error{
-                ErrorCode::InternalError,
-                "staged prefill returned an invalid result count"};
-        }
-        // Active batch results retain the input session order.
-        size_t active_index = 0;
+        auto executed = forward_decode_batch(compiled,
+                                             entries,
+                                             workspace);
+        if (!executed)
+            return executed.error();
         for (size_t session_index = 0;
              session_index < requests.size();
              ++session_index)
@@ -208,7 +202,6 @@ Result<std::vector<PrefillResult>> BatchSchedulerPrivate::prefill(std::span<Sess
                                                                   *session.state);
             if (!speculative_context)
                 return speculative_context.error();
-            results[session_index].logits = std::move(logits.value()[active_index++]);
         }
     }
 
@@ -251,6 +244,7 @@ Result<std::vector<DecodeResult>> BatchSchedulerPrivate::decode(std::span<Sessio
             return Error{ErrorCode::InvalidArgument, token_id_error_message};
     }
 
+    std::vector<DecodeResult> results(requests.size());
     std::vector<DecodeBatchEntry> entries(requests.size());
     for (size_t index = 0; index < requests.size(); ++index)
     {
@@ -262,16 +256,13 @@ Result<std::vector<DecodeResult>> BatchSchedulerPrivate::decode(std::span<Sessio
             &session.stats_scratch,
             session.state.get(),
             session.token_count,
+            &results[index].logits,
         };
     }
 
-    auto logits = forward_decode_batch(compiled, entries, workspace);
-    if (!logits)
-        return logits.error();
-    if (logits.value().size() != requests.size())
-    {
-        return Error{ErrorCode::InternalError, "staged decode returned an invalid result count"};
-    }
+    auto executed = forward_decode_batch(compiled, entries, workspace);
+    if (!executed)
+        return executed.error();
     for (size_t index = 0; index < requests.size(); ++index)
     {
         auto speculative_context = update_speculative_context(compiled,
@@ -281,12 +272,10 @@ Result<std::vector<DecodeResult>> BatchSchedulerPrivate::decode(std::span<Sessio
             return speculative_context.error();
     }
 
-    std::vector<DecodeResult> results(requests.size());
     for (size_t index = 0; index < requests.size(); ++index)
     {
         Session& session = *requests[index].session;
         session.commit_execution(0, 1);
-        results[index].logits = std::move(logits.value()[index]);
         results[index].sequence_length = session.token_count;
     }
     return results;

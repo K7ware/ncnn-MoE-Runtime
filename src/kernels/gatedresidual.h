@@ -11,15 +11,16 @@
 namespace ncnn {
 namespace moe {
 
+class CompiledOperatorTable;
+class WeightStore;
+struct GatedResidualPlan;
+struct MoeModelDescriptor;
+
 [[nodiscard]] Result<void> forward_gated_residual_pre(const ActivationBuffer& input,
-                                                      const TensorData& norm_weight,
-                                                      const TensorData& mix_down_weight,
-                                                      const TensorData& mix_up_weight,
-                                                      const TensorData& inject_weight,
-                                                      uint32_t multiplier,
-                                                      uint32_t hidden_size,
-                                                      float norm_epsilon,
-                                                      float norm_weight_offset,
+                                                      const WeightStore& weights,
+                                                      const CompiledOperatorTable& operators,
+                                                      const GatedResidualPlan& plan,
+                                                      const MoeModelDescriptor& descriptor,
                                                       HyperConnectionMix& result,
                                                       HyperConnectionScratch& scratch,
                                                       uint64_t optimization_flags);
@@ -32,13 +33,10 @@ namespace moe {
                                                        ActivationBuffer& output);
 
 [[nodiscard]] Result<void> forward_gated_residual_head(const ActivationBuffer& input,
-                                                       const TensorData& norm_weight,
-                                                       const TensorData& mix_down_weight,
-                                                       const TensorData& mix_up_weight,
-                                                       uint32_t multiplier,
-                                                       uint32_t hidden_size,
-                                                       float norm_epsilon,
-                                                       float norm_weight_offset,
+                                                       const WeightStore& weights,
+                                                       const CompiledOperatorTable& operators,
+                                                       const GatedResidualPlan& plan,
+                                                       const MoeModelDescriptor& descriptor,
                                                        ActivationBuffer& output,
                                                        HyperConnectionScratch& scratch,
                                                        uint64_t optimization_flags);

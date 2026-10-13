@@ -832,7 +832,11 @@ static FloatSiluInplaceFunction select_float_silu_inplace() noexcept
 
 float float_dot(const float* left, const float* right, uint32_t count) noexcept
 {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    const FloatDotFunction function = select_float_dot();
+#else
     static const FloatDotFunction function = select_float_dot();
+#endif
     return function(left, right, count);
 }
 
@@ -1082,7 +1086,6 @@ void float_sigmoid_mul(float* output,
                        const float* input,
                        uint32_t count) noexcept
 {
-    static const FloatSigmoidMulFunction function = select_float_sigmoid_mul();
     uint32_t index = 0;
 #if defined(__aarch64__) || defined(_M_ARM64)
     const float32x4_t one = vdupq_n_f32(1.0f);
@@ -1096,13 +1099,15 @@ void float_sigmoid_mul(float* output,
     }
 #endif
     if (index < count)
+    {
+        static const FloatSigmoidMulFunction function = select_float_sigmoid_mul();
         function(output + index, gate + index, input + index, count - index);
+    }
 }
 
 void float_silu_mul(float* output, const float* gate, const float* up,
                     float sigmoid_scale, float up_offset, uint32_t count) noexcept
 {
-    static const FloatSiluMulFunction function = select_float_silu_mul();
     uint32_t index = 0;
 #if defined(__aarch64__) || defined(_M_ARM64)
     const float32x4_t scale = vdupq_n_f32(sigmoid_scale);
@@ -1119,17 +1124,19 @@ void float_silu_mul(float* output, const float* gate, const float* up,
     }
 #endif
     if (index < count)
+    {
+        static const FloatSiluMulFunction function = select_float_silu_mul();
         function(output + index,
                  gate + index,
                  up + index,
                  sigmoid_scale,
                  up_offset,
                  count - index);
+    }
 }
 
 void float_silu_inplace(float* values, uint32_t count) noexcept
 {
-    static const FloatSiluInplaceFunction function = select_float_silu_inplace();
     uint32_t index = 0;
 #if defined(__aarch64__) || defined(_M_ARM64)
     const float32x4_t one = vdupq_n_f32(1.0f);
@@ -1141,7 +1148,10 @@ void float_silu_inplace(float* values, uint32_t count) noexcept
     }
 #endif
     if (index < count)
+    {
+        static const FloatSiluInplaceFunction function = select_float_silu_inplace();
         function(values + index, count - index);
+    }
 }
 
 void float_hc_pre_4(float* output, const float* input,

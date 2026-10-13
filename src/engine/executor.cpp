@@ -235,8 +235,8 @@ Result<void> forward_model(const CompiledModel& model,
     VulkanStatistics initial_vulkan_execution;
     if (model.vulkan_runtime)
         initial_vulkan_execution = get_vulkan_statistics(model.vulkan_runtime);
-    Bfloat16BatchedLinearExecutionCounter cpu_bfloat16_execution;
-    const ScopedBfloat16BatchedLinearExecutionCounter cpu_bfloat16_scope(&cpu_bfloat16_execution);
+    Bf16Counter bf16;
+    const Bf16Scope bf16_scope(&bf16);
     for (int32_t token_id : input_ids)
     {
         if (token_id < 0 || static_cast<uint32_t>(token_id) >= model.descriptor.vocabulary_size)
@@ -362,13 +362,10 @@ Result<void> forward_model(const CompiledModel& model,
             else if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
             {
                 auto head = forward_gated_residual_head(hidden,
-                                                        model.weights.at(model.gated_residual_head.norm_weight),
-                                                        model.weights.at(model.gated_residual_head.mix_down_weight),
-                                                        model.weights.at(model.gated_residual_head.mix_up_weight),
-                                                        model.descriptor.hyper_connection_multiplier,
-                                                        model.descriptor.hidden_size,
-                                                        model.descriptor.norm_epsilon,
-                                                        model.descriptor.norm_weight_offset,
+                                                        model.weights,
+                                                        model.operators,
+                                                        model.gated_residual_head,
+                                                        model.descriptor,
                                                         state.expert_scratch.staged_output,
                                                         state.hyper_connection_scratch,
                                                         model.opt.optimization_flags);
@@ -483,11 +480,10 @@ Result<void> forward_model(const CompiledModel& model,
                 return Error{ErrorCode::InternalError, "cannot materialize latent state for the next attention input"};
             if (layer.ple.enabled())
             {
-                auto ple = forward_ple(model.weights, layer.ple,
-                                       model.descriptor.hyper_connection_multiplier,
-                                       model.descriptor.hidden_size,
-                                       model.descriptor.norm_epsilon,
-                                       model.descriptor.norm_weight_offset,
+                auto ple = forward_ple(model.weights,
+                                       model.operators,
+                                       layer.ple,
+                                       model.descriptor,
                                        input_ids, state.layers[layer.layer_id], state.attention_scratch, hidden,
                                        model.opt.optimization_flags);
                 if (!ple)
@@ -498,14 +494,10 @@ Result<void> forward_model(const CompiledModel& model,
             if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
             {
                 auto mixed = forward_gated_residual_pre(hidden,
-                                                        model.weights.at(layer.attention_gated_residual.norm_weight),
-                                                        model.weights.at(layer.attention_gated_residual.mix_down_weight),
-                                                        model.weights.at(layer.attention_gated_residual.mix_up_weight),
-                                                        model.weights.at(layer.attention_gated_residual.inject_weight),
-                                                        model.descriptor.hyper_connection_multiplier,
-                                                        model.descriptor.hidden_size,
-                                                        model.descriptor.norm_epsilon,
-                                                        model.descriptor.norm_weight_offset,
+                                                        model.weights,
+                                                        model.operators,
+                                                        layer.attention_gated_residual,
+                                                        model.descriptor,
                                                         gated_attention_mix,
                                                         state.hyper_connection_scratch,
                                                         model.opt.optimization_flags);
@@ -656,14 +648,10 @@ Result<void> forward_model(const CompiledModel& model,
             if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
             {
                 auto mixed = forward_gated_residual_pre(hidden,
-                                                        model.weights.at(layer.ffn_gated_residual.norm_weight),
-                                                        model.weights.at(layer.ffn_gated_residual.mix_down_weight),
-                                                        model.weights.at(layer.ffn_gated_residual.mix_up_weight),
-                                                        model.weights.at(layer.ffn_gated_residual.inject_weight),
-                                                        model.descriptor.hyper_connection_multiplier,
-                                                        model.descriptor.hidden_size,
-                                                        model.descriptor.norm_epsilon,
-                                                        model.descriptor.norm_weight_offset,
+                                                        model.weights,
+                                                        model.operators,
+                                                        layer.ffn_gated_residual,
+                                                        model.descriptor,
                                                         layer_state.ffn_hyper_mix,
                                                         state.hyper_connection_scratch,
                                                         model.opt.optimization_flags);
@@ -924,7 +912,7 @@ Result<void> forward_model(const CompiledModel& model,
                                       initial_vulkan_execution,
                                       final_vulkan_execution);
     }
-    statistics.cpu_bfloat16_batched_linear_dispatches += cpu_bfloat16_execution.dispatch_count();
+    statistics.cpu_bfloat16_batched_linear_dispatches += bf16.dispatches();
     return {};
 }
 
@@ -990,9 +978,9 @@ static Result<void> forward_staged_shared_expert(const CompiledModel& model,
     return {};
 }
 
-Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel& model,
-                                                             std::span<const DecodeBatchEntry> entries,
-                                                             BatchWorkspace& workspace)
+Result<void> forward_decode_batch(const CompiledModel& model,
+                                  std::span<const DecodeBatchEntry> entries,
+                                  BatchWorkspace& workspace)
 {
     const ScopedExpertBackendForeground expert_backend_foreground(model.expert_backend);
     ScopedBatchWorkspace workspace_scope{workspace};
@@ -1002,19 +990,19 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
 
     if (model.descriptor.hyper_connection_kind == HyperConnectionKind::GatedResidual)
     {
-        std::vector<std::vector<float>> results;
-        results.reserve(entries.size());
         for (const DecodeBatchEntry& entry : entries)
         {
             if (!entry.statistics || !entry.state)
                 return Error{ErrorCode::InvalidArgument, "decode batch entry is incomplete"};
+            if (entry.logits)
+                entry.logits->clear();
             const std::array<int32_t, 1> input = {entry.input_id};
             auto executed = forward_model(model, input, *entry.statistics, *entry.state,
                                           entry.position_offset,
-                                          entry.output_logits ? LogitsOutput::All : LogitsOutput::None);
+                                          entry.logits ? LogitsOutput::All : LogitsOutput::None);
             if (!executed)
                 return executed.error();
-            if (entry.output_logits)
+            if (entry.logits)
             {
                 if (entry.state->logits.rows() != 1
                     || entry.state->logits.columns() != model.descriptor.vocabulary_size)
@@ -1022,29 +1010,30 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                     return Error{ErrorCode::InternalError, "gated-residual decode produced an invalid row count"};
                 }
                 const std::span<const float> values = entry.state->logits.values();
-                results.emplace_back(values.begin(), values.end());
+                entry.logits->assign(values.begin(), values.end());
             }
             else
             {
                 if (entry.state->logits.rows() != 0)
                     return Error{ErrorCode::InternalError, "gated-residual decode produced unexpected logits"};
-                results.emplace_back();
             }
         }
-        return results;
+        return {};
     }
 
     const size_t session_count = entries.size();
     const size_t requested_count = static_cast<size_t>(std::count_if(entries.begin(), entries.end(), [](const DecodeBatchEntry& entry) {
-        return entry.output_logits;
+        return entry.logits != nullptr;
     }));
     const bool all_output_logits = requested_count == session_count;
-    Bfloat16BatchedLinearExecutionCounter cpu_bfloat16_execution;
-    const ScopedBfloat16BatchedLinearExecutionCounter cpu_bfloat16_scope(&cpu_bfloat16_execution);
+    Bf16Counter bf16;
+    const Bf16Scope bf16_scope(&bf16);
     for (const DecodeBatchEntry& entry : entries)
     {
         if (!entry.statistics || !entry.state)
             return Error{ErrorCode::InvalidArgument, "decode batch entry is incomplete"};
+        if (entry.logits)
+            entry.logits->clear();
         if (has_unknown_vulkan_attention_state(*entry.state))
         {
             return Error{
@@ -1055,7 +1044,6 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
     const uint32_t hyper_multiplier = model.descriptor.hyper_connection_multiplier;
     const uint32_t hyper_iterations = model.descriptor.hyper_connection_iterations;
     const float hyper_epsilon = model.descriptor.hyper_connection_epsilon;
-    std::vector<std::vector<float>> logits(session_count);
     for (size_t session_index = 0; session_index < session_count; ++session_index)
     {
         const DecodeBatchEntry& entry = entries[session_index];
@@ -1272,8 +1260,11 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                     return Error{ErrorCode::InternalError, "continuous staged latent LM head execution failed"};
                 for (size_t row = 0; row < session_count; ++row)
                 {
-                    if (entries[row].output_logits)
-                        logits[row].assign(gpu_logits.row(row), gpu_logits.row(row) + gpu_logits.columns());
+                    if (entries[row].logits)
+                    {
+                        entries[row].logits->assign(gpu_logits.row(row),
+                                                    gpu_logits.row(row) + gpu_logits.columns());
+                    }
                 }
                 deferred_gpu_head = false;
                 continue;
@@ -1301,7 +1292,7 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
                 size_t output_index = 0;
                 for (size_t session_index = 0; session_index < session_count; ++session_index)
                 {
-                    if (!entries[session_index].output_logits)
+                    if (!entries[session_index].logits)
                         continue;
                     const ActivationBuffer& hidden = entries[session_index].state->hidden;
                     if (hidden.rows() != 1 || hidden.columns() != hidden_columns)
@@ -1348,12 +1339,12 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
             size_t output_index = 0;
             for (size_t session_index = 0; session_index < session_count; ++session_index)
             {
-                if (!all_output_logits && !entries[session_index].output_logits)
+                if (!all_output_logits && !entries[session_index].logits)
                     continue;
                 const size_t source_index = all_output_logits ? session_index : output_index++;
                 const float* source = scratch.staged_output.row(source_index);
-                logits[session_index].assign(source,
-                                             source + scratch.staged_output.columns());
+                entries[session_index].logits->assign(source,
+                                                      source + scratch.staged_output.columns());
             }
             continue;
         }
@@ -1997,13 +1988,10 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
     record_batch_resource_delta(model, entries, cache_before, backend_before);
     for (size_t session_index = 0; session_index < session_count; ++session_index)
     {
-        if (entries[session_index].output_logits && logits[session_index].empty())
+        if (entries[session_index].logits
+            && entries[session_index].logits->size() != model.descriptor.vocabulary_size)
         {
             return Error{ErrorCode::InternalError, "staged execution graph did not produce logits"};
-        }
-        if (!entries[session_index].output_logits && !logits[session_index].empty())
-        {
-            return Error{ErrorCode::InternalError, "staged execution graph produced unexpected logits"};
         }
     }
     if (model.vulkan_runtime)
@@ -2012,12 +2000,12 @@ Result<std::vector<std::vector<float>>> forward_decode_batch(const CompiledModel
         for (const DecodeBatchEntry& entry : entries)
             record_vulkan_execution_delta(*entry.statistics, batch_vulkan_before, batch_vulkan_after);
     }
-    const uint64_t cpu_bfloat16_dispatches = cpu_bfloat16_execution.dispatch_count();
+    const uint64_t bf16_dispatches = bf16.dispatches();
     for (const DecodeBatchEntry& entry : entries)
     {
-        entry.statistics->cpu_bfloat16_batched_linear_dispatches += cpu_bfloat16_dispatches;
+        entry.statistics->cpu_bfloat16_batched_linear_dispatches += bf16_dispatches;
     }
-    return logits;
+    return {};
 }
 
 static void collect_ranked_experts(const ExpertDispatchPlan& plan,
@@ -2481,15 +2469,14 @@ static Result<void> predict_next_router_routes(const CompiledModel& model,
             ActivationBuffer copied_input = router_input;
             auto promise = std::make_shared<std::promise<Result<RouterPredictionOutcome>>>();
             std::future<Result<RouterPredictionOutcome>> future = promise->get_future();
-            Bfloat16BatchedLinearExecutionCounter* const bfloat16_counter = current_bfloat16_batched_linear_execution_counter();
+            Bf16Counter* const bf16_counter = current_bf16_counter();
             if (state.router_prediction_worker->try_submit([&model,
                                                             next_layer,
                                                             copied_input = std::move(copied_input),
                                                             prefetch_width,
-                                                            bfloat16_counter,
+                                                            bf16_counter,
                                                             promise]() mutable {
-                    const ScopedBfloat16BatchedLinearExecutionCounter
-                        bfloat16_scope(bfloat16_counter);
+                    const Bf16Scope bf16_scope(bf16_counter);
                     try
                     {
                         promise->set_value(run_router_prediction(model,

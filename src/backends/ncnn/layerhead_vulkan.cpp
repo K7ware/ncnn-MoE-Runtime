@@ -69,7 +69,7 @@ std::shared_ptr<LayerHead_vulkan> LayerHead_vulkan::create(const TensorData& fun
         implementation.context = lm_head.bfloat16->vulkan_context();
         implementation.opt = lm_head.bfloat16->option();
     }
-    else if (lm_head.linear && lm_head.linear->uses_vulkan() && lm_head.linear->vulkan_context()
+    else if (lm_head.linear && lm_head.linear->vulkan_context()
              && lm_head.linear->input_columns() == hidden_size
              && vulkan_activation_storage_variant(lm_head.linear->option()) == 0)
     {

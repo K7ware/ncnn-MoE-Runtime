@@ -570,32 +570,6 @@ VulkanStatistics get_vulkan_statistics(const VulkanRuntimePtr& vulkan_runtime) n
 }
 
 #if NCNN_MOE_WITH_VULKAN
-static uint32_t vulkan_command_optimization_flags(uint64_t optimization_flags) noexcept
-{
-    uint32_t flags = 0;
-    if (has_flag(optimization_flags,
-                 OptimizationVulkanPipelineBindElision))
-    {
-        flags |= ncnn::VkComputeOptimizationPipelineBindElision;
-    }
-    if (has_flag(optimization_flags,
-                 OptimizationVulkanReadonlyBindings))
-    {
-        flags |= ncnn::VkComputeOptimizationReadonlyBindings;
-    }
-    if (has_flag(optimization_flags,
-                 OptimizationVulkanBatchBufferBarriers))
-    {
-        flags |= ncnn::VkComputeOptimizationBatchBufferBarriers;
-    }
-    if (has_flag(optimization_flags,
-                 OptimizationVulkanStackDescriptorPayload))
-    {
-        flags |= ncnn::VkComputeOptimizationStackDescriptorPayload;
-    }
-    return flags;
-}
-
 VulkanStatistics VulkanRuntimeState::snapshot() const noexcept
 {
     VulkanStatistics result;
@@ -745,7 +719,6 @@ std::shared_ptr<VulkanContext> VulkanContext::acquire(uint32_t requested_device_
     {
         return {};
     }
-    const uint32_t command_flags = vulkan_command_optimization_flags(optimization_flags);
     ncnn::VulkanDevice* device = ncnn::get_gpu_device(static_cast<int>(device_index));
     if (!device)
         return {};
@@ -764,8 +737,7 @@ std::shared_ptr<VulkanContext> VulkanContext::acquire(uint32_t requested_device_
     }
     auto context = std::shared_ptr<VulkanContext>(new VulkanContext(device,
                                                                     vulkan_runtime,
-                                                                    optimization_flags,
-                                                                    command_flags));
+                                                                    optimization_flags));
     vulkan_runtime->contexts.emplace(context_key, context);
     return context;
 }
@@ -831,12 +803,10 @@ VulkanTransferLease VulkanContext::acquire_transfer_slot()
 
 VulkanContext::VulkanContext(ncnn::VulkanDevice* device,
                              VulkanRuntimePtr _vulkan_runtime,
-                             uint64_t optimization_flags,
-                             uint32_t command_optimization_flags)
+                             uint64_t optimization_flags)
     : vkdev(device),
       vulkan_runtime(std::move(_vulkan_runtime)),
-      flags(optimization_flags),
-      command_flags(command_optimization_flags)
+      flags(optimization_flags)
 {
     try
     {
@@ -846,7 +816,7 @@ VulkanContext::VulkanContext(ncnn::VulkanDevice* device,
         for (VulkanTransferSlot& slot : transfer_slots)
             slot.staging_allocator = device->acquire_staging_allocator();
         for (VulkanTransferSlot& slot : transfer_slots)
-            slot.command = new ncnn::VkCompute(device, command_flags);
+            slot.command = new ncnn::VkCompute(device);
     }
     catch (...)
     {

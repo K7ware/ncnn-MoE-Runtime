@@ -40,7 +40,7 @@ static void verify_payload(const std::shared_ptr<VulkanContext>& context, const 
                            size_t bytes, uint8_t seed)
 {
     const std::lock_guard<std::mutex> lock(context->command_mutex());
-    ncnn::VkCompute command(context->device(), context->command_optimization_flags());
+    ncnn::VkCompute command(context->device());
     ncnn::Mat downloaded;
     command.record_download(device, downloaded, upload_option(context));
     upload_check(command.submit_and_wait() == 0 && !downloaded.empty(), "download uploaded byte storage");
@@ -385,7 +385,7 @@ static void expert_submission_pool()
     identity.float32_data.assign(32 * 32, 0.0f);
     for (uint32_t column = 0; column < 32; ++column)
         identity.float32_data[column * 32 + column] = 1.0f;
-    const auto graph_seed = Linear::create(identity, nullptr, LinearDevice::Vulkan, 0, runtime, flags);
+    const auto graph_seed = Linear::create(identity, nullptr, 0, runtime, flags);
     upload_check(static_cast<bool>(graph_seed), "device-only pool graph seed");
     const ActivationBuffer normalized = submission_pool_input(4, 83);
     const ActivationBuffer resident_expected = submission_pool_oracle(*gate, *down, normalized, flags);

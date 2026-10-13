@@ -75,7 +75,7 @@ static ActivationBuffer router_run(const Router_vulkan& router,
     ncnn::VkMat staging;
     ncnn::VkMat device_input;
     ncnn::VkMat download;
-    ncnn::VkCompute cmd(context->device(), context->command_optimization_flags());
+    ncnn::VkCompute cmd(context->device());
     ActivationBuffer selected(input.rows(),
                               Router_vulkan::selected_columns(options.top_k));
     const std::lock_guard<std::mutex> lock(context->command_mutex());
@@ -197,6 +197,8 @@ static void router_test_ties_and_extremes()
     ExpertDispatchOptions options;
     options.expert_count = 32;
     options.top_k = 16;
+    ExpertDispatchPlan expected;
+    ExpertDispatchPlan actual;
     for (RouterScoreFunction score :
          {RouterScoreFunction::Softmax, RouterScoreFunction::Sigmoid,
           RouterScoreFunction::SqrtSoftplus})
@@ -207,8 +209,6 @@ static void router_test_ties_and_extremes()
         ActivationBuffer logits = input;
         for (float& value : std::span<float>(logits.row(0), 32))
             value += 0.5f;
-        ExpertDispatchPlan expected;
-        ExpertDispatchPlan actual;
         router_check(static_cast<bool>(forward_router(logits.values(), 1, options, expected)),
                      "tie CPU oracle");
         router_check(static_cast<bool>(Router_vulkan::decode_selected(router_run(*router, input, options), options, actual)),
@@ -228,6 +228,25 @@ static void router_test_ties_and_extremes()
                      "extreme GPU decode");
         router_check_plan(actual, expected, "negative extreme logits");
     }
+
+    options.top_k = 1;
+    options.score_function = RouterScoreFunction::Softmax;
+    options.normalization = RouterNormalization::SelectedExperts;
+    std::fill_n(input.row(0), 32, -4.0f);
+    input.row(0)[0] = -0.5f;
+    input.row(0)[31] = std::nextafter(-0.5f, 0.0f);
+    ActivationBuffer near_logits = input;
+    for (float& value : std::span<float>(near_logits.row(0), 32))
+        value += 0.5f;
+    router_check(static_cast<bool>(forward_router(near_logits.values(), 1, options, expected)),
+                 "near-tie raw-logit CPU oracle");
+    const ActivationBuffer near_selected = router_run(*router, input, options);
+    router_check(static_cast<bool>(Router_vulkan::decode_selected(near_selected, options, actual)),
+                 "near-tie raw-logit GPU decode");
+    router_check_plan(actual, expected, "near-tie raw-logit ordering");
+    router_check(actual.batches.size() == 1 && actual.batches[0].expert_id == 31,
+                 "near-tie selects the greater raw logit");
+
     options.top_k = 32;
     options.score_function = RouterScoreFunction::SqrtSoftplus;
     options.normalization = RouterNormalization::None;

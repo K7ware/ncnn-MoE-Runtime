@@ -7,7 +7,6 @@
 
 #include "ncnn/moe/runtime.h"
 #include "engine/expertbackend.h"
-#include "engine/cpu.h"
 #include "kernels/float8.h"
 #include "kernels/ops.h"
 #include "kernels/qnk.h"
@@ -59,22 +58,6 @@
 namespace ncnn {
 namespace moe {
 
-#if NCNN_MOE_USE_NCNN
-static constexpr uint64_t max_ncnn_linear_weight_size = 64ull * 1024ull * 1024ull;
-
-static bool ncnn_cpu_bfloat16_linear_enabled(uint64_t optimization_flags) noexcept
-{
-    const uint64_t isa = cpu_isa_flags();
-    // Keep ncnn's FP32-expanded path as the conservative default on
-    // unbenchmarked ISAs. The direct BF16 path is default only where its
-    // AVX512 implementation has been validated end to end.
-    const bool default_enabled = (isa & CpuIsaX86Avx512) == 0;
-    return default_enabled
-           && has_flag(optimization_flags,
-                       OptimizationNcnnCpuBfloat16Linear);
-}
-#endif
-
 class Linear::Implementation
 {
 public:
@@ -84,18 +67,10 @@ public:
         if (layer)
         {
 #if NCNN_MOE_WITH_VULKAN
-            if (vulkan_context)
-            {
-                const std::lock_guard<std::mutex> lock(vulkan_context->command_mutex());
-                if (pipeline_created)
-                    layer->destroy_pipeline(option);
-            }
-            else
-#endif
-                if (pipeline_created)
-            {
+            const std::lock_guard<std::mutex> lock(vulkan_context->command_mutex());
+            if (pipeline_created)
                 layer->destroy_pipeline(option);
-            }
+#endif
             delete layer;
         }
 #if NCNN_MOE_WITH_VULKAN
@@ -106,11 +81,9 @@ public:
 
     ncnn::Layer* layer = nullptr;
     ncnn::Option option;
-    mutable std::mutex forward_mutex;
     uint32_t input_columns = 0;
     uint32_t output_columns = 0;
     bool pipeline_created = false;
-    uint64_t optimization_flags = OptimizationDefaultFlags;
 #if NCNN_MOE_WITH_VULKAN
     std::shared_ptr<VulkanContext> vulkan_context;
     std::unique_ptr<ncnn::VkWeightAllocator> weight_allocator;
@@ -358,9 +331,6 @@ CommandGraph_vulkan& CommandGraph_vulkan::operator=(CommandGraph_vulkan&& other)
 std::unique_ptr<CommandGraph_vulkan> CommandGraph_vulkan::create(const Linear& seed)
 {
 #if NCNN_MOE_USE_NCNN && NCNN_MOE_WITH_VULKAN
-    if (!seed.uses_vulkan())
-        return {};
-
     auto implementation = std::make_unique<Implementation>();
     implementation->context = seed.vulkan_context();
     implementation->option = seed.option();
@@ -639,46 +609,19 @@ bool CommandGraph_vulkan::wait()
 #endif
 }
 
-const char* Linear::cpu_small_bfloat16_linear_policy(uint64_t optimization_flags) noexcept
-{
-#if NCNN_MOE_USE_NCNN
-    return ncnn_cpu_bfloat16_linear_enabled(optimization_flags)
-               ? "ncnn-fp32-expanded"
-               : "moe-direct-bfloat16";
-#else
-    (void)optimization_flags;
-    return "moe-direct-bfloat16";
-#endif
-}
-
-std::shared_ptr<Linear> Linear::create(const TensorData& matrix, const TensorData* bias, LinearDevice device,
+std::shared_ptr<Linear> Linear::create(const TensorData& matrix, const TensorData* bias,
                                        uint32_t vulkan_device_index,
                                        const VulkanRuntimePtr& vulkan_runtime,
                                        uint64_t optimization_flags)
 {
-#if !NCNN_MOE_WITH_VULKAN
-    (void)vulkan_device_index;
-    (void)vulkan_runtime;
-#endif
-#if NCNN_MOE_USE_NCNN
+#if NCNN_MOE_USE_NCNN && NCNN_MOE_WITH_VULKAN
     if (matrix.shape.size() != 2 || (matrix.dtype != DType::Float32 && matrix.dtype != DType::BFloat16))
-        return {};
-    if (device == LinearDevice::Cpu
-        && matrix.dtype == DType::BFloat16
-        && !ncnn_cpu_bfloat16_linear_enabled(optimization_flags))
-    {
-        return {};
-    }
-
-    const uint64_t element_size = matrix.dtype == DType::BFloat16 ? sizeof(uint16_t) : sizeof(float);
-    if (device == LinearDevice::Cpu && matrix.element_count() > max_ncnn_linear_weight_size / element_size)
         return {};
     if (matrix.element_count() > static_cast<uint64_t>(std::numeric_limits<int>::max()))
         return {};
 
     std::shared_ptr<Linear> linear(new Linear);
     Implementation& implementation = *linear->d;
-    implementation.optimization_flags = optimization_flags;
     implementation.input_columns = matrix.shape[1];
     implementation.output_columns = matrix.shape[0];
     implementation.option.use_fp16_packed = false;
@@ -687,31 +630,22 @@ std::shared_ptr<Linear> Linear::create(const TensorData& matrix, const TensorDat
     implementation.option.use_bf16_packed = false;
     implementation.option.use_bf16_storage = false;
 
-#if NCNN_MOE_WITH_VULKAN
-    if (device == LinearDevice::Vulkan)
-    {
-        implementation.vulkan_context = VulkanContext::acquire(vulkan_device_index,
-                                                               vulkan_runtime,
-                                                               optimization_flags);
-        if (!implementation.vulkan_context)
-            return {};
+    implementation.vulkan_context = VulkanContext::acquire(vulkan_device_index,
+                                                           vulkan_runtime,
+                                                           optimization_flags);
+    if (!implementation.vulkan_context)
+        return {};
 
-        ncnn::VulkanDevice* vkdev = implementation.vulkan_context->device();
-        implementation.option.use_vulkan_compute = true;
-        implementation.option.blob_vkallocator = implementation.vulkan_context->blob_allocator();
-        implementation.option.workspace_vkallocator = implementation.vulkan_context->blob_allocator();
-        implementation.option.staging_vkallocator = implementation.vulkan_context->staging_allocator();
-        implementation.option.use_cooperative_matrix = vkdev->info.support_cooperative_matrix();
-        implementation.option.use_subgroup_ops = vkdev->info.support_subgroup_ops();
-        implementation.layer = ncnn::create_layer_vulkan(ncnn::LayerType::InnerProduct);
-        if (implementation.layer)
-            implementation.layer->vkdev = vkdev;
-    }
-    else
-#endif
-    {
-        implementation.layer = ncnn::create_layer_cpu(ncnn::LayerType::InnerProduct);
-    }
+    ncnn::VulkanDevice* vkdev = implementation.vulkan_context->device();
+    implementation.option.use_vulkan_compute = true;
+    implementation.option.blob_vkallocator = implementation.vulkan_context->blob_allocator();
+    implementation.option.workspace_vkallocator = implementation.vulkan_context->blob_allocator();
+    implementation.option.staging_vkallocator = implementation.vulkan_context->staging_allocator();
+    implementation.option.use_cooperative_matrix = vkdev->info.support_cooperative_matrix();
+    implementation.option.use_subgroup_ops = vkdev->info.support_subgroup_ops();
+    implementation.layer = ncnn::create_layer_vulkan(ncnn::LayerType::InnerProduct);
+    if (implementation.layer)
+        implementation.layer->vkdev = vkdev;
     if (!implementation.layer)
         return {};
 
@@ -750,39 +684,34 @@ std::shared_ptr<Linear> Linear::create(const TensorData& matrix, const TensorDat
         return {};
     implementation.pipeline_created = true;
 
-#if NCNN_MOE_WITH_VULKAN
-    if (implementation.vulkan_context)
-    {
-        ncnn::VulkanDevice* vkdev = implementation.vulkan_context->device();
-        implementation.weight_allocator.reset(new ncnn::VkWeightAllocator(vkdev));
-        implementation.weight_staging_allocator.reset(new ncnn::VkWeightStagingAllocator(vkdev));
-        const std::lock_guard<std::mutex> lock(implementation.vulkan_context->command_mutex());
-        ncnn::VkTransfer command(vkdev);
-        ncnn::Option upload_option = implementation.option;
-        upload_option.blob_vkallocator = implementation.weight_allocator.get();
-        upload_option.workspace_vkallocator = implementation.weight_allocator.get();
-        upload_option.staging_vkallocator = implementation.weight_staging_allocator.get();
-        if (implementation.layer->upload_model(command, upload_option) != 0 || command.submit_and_wait() != 0)
-            return {};
-    }
-#endif
+    implementation.weight_allocator.reset(new ncnn::VkWeightAllocator(vkdev));
+    implementation.weight_staging_allocator.reset(new ncnn::VkWeightStagingAllocator(vkdev));
+    const std::lock_guard<std::mutex> lock(implementation.vulkan_context->command_mutex());
+    ncnn::VkTransfer command(vkdev);
+    ncnn::Option upload_option = implementation.option;
+    upload_option.blob_vkallocator = implementation.weight_allocator.get();
+    upload_option.workspace_vkallocator = implementation.weight_allocator.get();
+    upload_option.staging_vkallocator = implementation.weight_staging_allocator.get();
+    if (implementation.layer->upload_model(command, upload_option) != 0 || command.submit_and_wait() != 0)
+        return {};
     return linear;
 #else
     (void)matrix;
     (void)bias;
-    (void)device;
     (void)vulkan_device_index;
     (void)vulkan_runtime;
+    (void)optimization_flags;
     return {};
 #endif
 }
 
 std::shared_ptr<Linear> Linear::create_fused(const std::vector<const TensorData*>& matrices,
-                                             const std::vector<const TensorData*>& biases, LinearDevice device,
+                                             const std::vector<const TensorData*>& biases,
                                              uint32_t vulkan_device_index,
                                              const VulkanRuntimePtr& vulkan_runtime,
                                              uint64_t optimization_flags)
 {
+#if NCNN_MOE_USE_NCNN && NCNN_MOE_WITH_VULKAN
     if (matrices.empty() || matrices.size() != biases.size() || !matrices.front())
         return {};
 
@@ -847,97 +776,80 @@ std::shared_ptr<Linear> Linear::create_fused(const std::vector<const TensorData*
     }
     return create(fused_matrix,
                   has_bias ? &fused_bias : nullptr,
-                  device,
                   vulkan_device_index,
                   vulkan_runtime,
                   optimization_flags);
+#else
+    (void)matrices;
+    (void)biases;
+    (void)vulkan_device_index;
+    (void)vulkan_runtime;
+    (void)optimization_flags;
+    return {};
+#endif
 }
 
 bool Linear::forward(const ActivationBuffer& input, ActivationBuffer& output) const
 {
-#if NCNN_MOE_USE_NCNN
+#if NCNN_MOE_USE_NCNN && NCNN_MOE_WITH_VULKAN
     const Implementation& implementation = *d;
     if (!implementation.layer || input.columns() != implementation.input_columns)
         return false;
 
-#if NCNN_MOE_WITH_VULKAN
-    if (implementation.vulkan_context)
-    {
-        VulkanRuntimeState& runtime_state = implementation.vulkan_context->runtime_state();
-        VulkanTransferLease transfer_lease = implementation.vulkan_context->acquire_transfer_slot();
-        VulkanTransferSlot& transfer_slot = transfer_lease.slot();
-        const DType output_dtype = output.dtype();
-        if (!fill_staging_upload(input,
-                                 transfer_slot.upload,
-                                 transfer_slot.staging_allocator)
-            || !prepare_staging_batch(transfer_slot.download,
-                                      input.rows(),
-                                      implementation.output_columns,
-                                      transfer_slot.staging_allocator,
-                                      output.element_size()))
-            return false;
-
-        output.reset(input.rows(), implementation.output_columns, false);
-        std::unique_lock<std::mutex> lock(implementation.vulkan_context->command_mutex());
-        ncnn::VulkanDevice* vkdev = implementation.vulkan_context->device();
-        ncnn::VkCompute& command = *transfer_slot.command;
-        if (transfer_slot.command_used)
-        {
-            if (command.reset() != 0)
-                return false;
-            ++runtime_state.command_buffer_reuses;
-        }
-        transfer_slot.command_used = true;
-        ncnn::VkMat bottom_gpu;
-        if (!record_prepared_staging_upload(transfer_slot.upload, input.rows(), bottom_gpu, command, vkdev, implementation.option, input.dtype()))
-            return false;
-
-        ncnn::VkMat top_gpu;
-        if (implementation.layer->forward(bottom_gpu, top_gpu, command, implementation.option) != 0)
-            return false;
-        ncnn::VkMat download_gpu = top_gpu;
-        if (top_gpu.elempack != 1)
-        {
-            ncnn::VkMat unpacked;
-            vkdev->convert_packing(top_gpu, unpacked, 1, command, implementation.option);
-            download_gpu = unpacked;
-        }
-        if (!record_prepared_activation_staging_download(download_gpu,
-                                                         input.rows(),
-                                                         implementation.output_columns,
-                                                         transfer_slot.download,
-                                                         command,
-                                                         vkdev,
-                                                         implementation.option,
-                                                         output_dtype))
-            return false;
-        if (submit_compute_and_wait(command, implementation.vulkan_context->device()) != 0 || !copy_staging_to_cpu_batch(transfer_slot.download, output))
-            return false;
-        ++runtime_state.dispatches;
-        ++runtime_state.compute_submissions;
-        ++runtime_state.batch_uploads;
-        ++runtime_state.batch_downloads;
-        return true;
-    }
-#endif
-
-    const std::lock_guard<std::mutex> lock(implementation.forward_mutex);
-    ncnn::Mat bottom(static_cast<int>(input.columns()), static_cast<int>(input.rows()), sizeof(float));
-    if (bottom.empty())
+    VulkanRuntimeState& runtime_state = implementation.vulkan_context->runtime_state();
+    VulkanTransferLease transfer_lease = implementation.vulkan_context->acquire_transfer_slot();
+    VulkanTransferSlot& transfer_slot = transfer_lease.slot();
+    const DType output_dtype = output.dtype();
+    if (!fill_staging_upload(input,
+                             transfer_slot.upload,
+                             transfer_slot.staging_allocator)
+        || !prepare_staging_batch(transfer_slot.download,
+                                  input.rows(),
+                                  implementation.output_columns,
+                                  transfer_slot.staging_allocator,
+                                  output.element_size()))
         return false;
-    for (size_t row_index = 0; row_index < input.rows(); ++row_index)
-        std::copy_n(input.row(row_index), input.columns(), bottom.row<float>(static_cast<int>(row_index)));
 
-    ncnn::Mat top;
-    if (implementation.layer->forward(bottom, top, implementation.option) != 0 || top.empty()
-        || top.total() * top.elempack != input.rows() * implementation.output_columns)
-        return false;
     output.reset(input.rows(), implementation.output_columns, false);
-    for (size_t row_index = 0; row_index < input.rows(); ++row_index)
+    std::unique_lock<std::mutex> lock(implementation.vulkan_context->command_mutex());
+    ncnn::VulkanDevice* vkdev = implementation.vulkan_context->device();
+    ncnn::VkCompute& command = *transfer_slot.command;
+    if (transfer_slot.command_used)
     {
-        const float* source = top.row<float>(static_cast<int>(row_index));
-        std::copy_n(source, implementation.output_columns, output.row(row_index));
+        if (command.reset() != 0)
+            return false;
+        ++runtime_state.command_buffer_reuses;
     }
+    transfer_slot.command_used = true;
+    ncnn::VkMat bottom_gpu;
+    if (!record_prepared_staging_upload(transfer_slot.upload, input.rows(), bottom_gpu, command, vkdev, implementation.option, input.dtype()))
+        return false;
+
+    ncnn::VkMat top_gpu;
+    if (implementation.layer->forward(bottom_gpu, top_gpu, command, implementation.option) != 0)
+        return false;
+    ncnn::VkMat download_gpu = top_gpu;
+    if (top_gpu.elempack != 1)
+    {
+        ncnn::VkMat unpacked;
+        vkdev->convert_packing(top_gpu, unpacked, 1, command, implementation.option);
+        download_gpu = unpacked;
+    }
+    if (!record_prepared_activation_staging_download(download_gpu,
+                                                     input.rows(),
+                                                     implementation.output_columns,
+                                                     transfer_slot.download,
+                                                     command,
+                                                     vkdev,
+                                                     implementation.option,
+                                                     output_dtype))
+        return false;
+    if (submit_compute_and_wait(command, implementation.vulkan_context->device()) != 0 || !copy_staging_to_cpu_batch(transfer_slot.download, output))
+        return false;
+    ++runtime_state.dispatches;
+    ++runtime_state.compute_submissions;
+    ++runtime_state.batch_uploads;
+    ++runtime_state.batch_downloads;
     return true;
 #else
     (void)input;
@@ -985,15 +897,6 @@ uint32_t Linear::output_columns() const noexcept
     return d->output_columns;
 }
 #endif
-
-bool Linear::uses_vulkan() const noexcept
-{
-#if NCNN_MOE_WITH_VULKAN
-    return d->vulkan_context != nullptr;
-#else
-    return false;
-#endif
-}
 
 class Bfloat16Linear_vulkan::Implementation
 {

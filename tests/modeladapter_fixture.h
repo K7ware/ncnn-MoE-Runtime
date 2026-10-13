@@ -3,8 +3,14 @@
 
 #include "ncnn/moe/modeladapter.h"
 
+#include <vector>
+
 namespace ncnn {
 namespace moe {
+
+class ActivationBuffer;
+
+[[nodiscard]] std::vector<std::vector<float>> batch_to_vectors(const ActivationBuffer& batch);
 
 class FixtureModelAdapter final : public ModelAdapter
 {

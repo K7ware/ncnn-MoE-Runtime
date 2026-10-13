@@ -35,8 +35,6 @@ struct ExpertCacheLease
     // this lease's private pin keeps that Entry alive.
     const CompiledOperator* gate_up_operator = nullptr;
     const CompiledOperator* down_operator = nullptr;
-    bool cache_hit = false;
-    uint64_t bytes_read = 0;
 
 private:
     std::shared_ptr<const void> pin;

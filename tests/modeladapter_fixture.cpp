@@ -1,5 +1,6 @@
 #include "modeladapter_fixture.h"
 
+#include "kernels/activationbuffer.h"
 #include "models/tensornames.h"
 
 #include <cstring>
@@ -10,6 +11,17 @@
 
 namespace ncnn {
 namespace moe {
+
+std::vector<std::vector<float>> batch_to_vectors(const ActivationBuffer& batch)
+{
+    std::vector<std::vector<float>> output(batch.rows());
+    if (batch.columns() == 0)
+        return output;
+    for (size_t row_index = 0; row_index < batch.rows(); ++row_index)
+        output[row_index].assign(batch.row(row_index),
+                                 batch.row(row_index) + batch.columns());
+    return output;
+}
 
 static Result<uint32_t> required_uint32(const std::string& json, const std::string& key)
 {

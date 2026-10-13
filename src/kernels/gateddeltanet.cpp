@@ -454,10 +454,12 @@ Result<void> forward_gated_delta(const WeightStore& weights,
     if (!fused_input)
     {
         if (backend != ExecutionBackend::Cpu
-            || !forward_linear_pair(weights.at(plan.delta_qkv_weight), weights.at(plan.delta_z_weight), *normalized,
-                                    scratch.qkv, scratch.z, optimization_flags,
-                                    operators.find_weight(plan.delta_qkv_weight), operators.find_weight(plan.delta_z_weight),
-                                    &scratch.fused_input))
+            || !forward_linear({&weights.at(plan.delta_qkv_weight),
+                                &weights.at(plan.delta_z_weight)},
+                               *normalized, {&scratch.qkv, &scratch.z}, optimization_flags,
+                               {operators.find_weight(plan.delta_qkv_weight),
+                                operators.find_weight(plan.delta_z_weight)},
+                               &scratch.fused_input))
         {
             forward_linear(weights.at(plan.delta_qkv_weight), *normalized, scratch.qkv, optimization_flags,
                            operators.find_weight(plan.delta_qkv_weight));
@@ -465,10 +467,12 @@ Result<void> forward_gated_delta(const WeightStore& weights,
                            operators.find_weight(plan.delta_z_weight));
         }
         if (backend != ExecutionBackend::Cpu
-            || !forward_linear_pair(weights.at(plan.delta_beta_weight), weights.at(plan.delta_alpha_weight), *normalized,
-                                    scratch.beta, scratch.alpha, optimization_flags,
-                                    operators.find_weight(plan.delta_beta_weight), operators.find_weight(plan.delta_alpha_weight),
-                                    &scratch.fused_input))
+            || !forward_linear({&weights.at(plan.delta_beta_weight),
+                                &weights.at(plan.delta_alpha_weight)},
+                               *normalized, {&scratch.beta, &scratch.alpha}, optimization_flags,
+                               {operators.find_weight(plan.delta_beta_weight),
+                                operators.find_weight(plan.delta_alpha_weight)},
+                               &scratch.fused_input))
         {
             forward_linear(weights.at(plan.delta_beta_weight), *normalized, scratch.beta, optimization_flags,
                            operators.find_weight(plan.delta_beta_weight));

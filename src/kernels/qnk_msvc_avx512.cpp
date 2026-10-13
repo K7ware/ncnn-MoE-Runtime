@@ -46,7 +46,7 @@ static float half_to_float(uint16_t value) noexcept
         if (mantissa != 0)
         {
             uint32_t normalized = mantissa;
-            int32_t exponent_shift = -1;
+            int32_t exponent_shift = 0;
             while ((normalized & 0x0400u) == 0)
             {
                 normalized <<= 1;

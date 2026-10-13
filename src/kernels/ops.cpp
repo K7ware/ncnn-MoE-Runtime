@@ -12,6 +12,8 @@
 #include "ncnn/moe/option.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cmath>
@@ -24,7 +26,6 @@
 #include <string>
 
 #if defined(__APPLE__)
-#include <atomic>
 #include <TargetConditionals.h>
 #if defined(__has_include)
 #if __has_include(<vecLib/cblas_new.h>) && !defined(ACCELERATE_NEW_LAPACK)
@@ -139,8 +140,8 @@ int cpu_linear_team_size(uint64_t operation_count, DType dtype) noexcept
     uint64_t min_ops = dtype == DType::Float8E4M3 ? 1024u * 1024u : 2u * 1024u * 1024u;
     uint64_t full_ops = 8u * 1024u * 1024u;
 #if defined(NCNN_MOE_USE_NCNN) && NCNN_MOE_USE_NCNN
-    // Small BF16 teams pay off only with the short execution wait policy.
-    if (dtype == DType::BFloat16 && ncnn::get_kmp_blocktime() == 1)
+    // Small low-precision teams pay off only with the short execution wait policy.
+    if ((dtype == DType::BFloat16 || is_qnk_dtype(dtype)) && ncnn::get_kmp_blocktime() == 1)
     {
         min_ops = 64u * 1024u;
         full_ops = 512u * 1024u;
@@ -445,6 +446,14 @@ static bool bfloat16_linear_gemm_tile_into(const TensorData& matrix,
             {
                 block_k = std::min(input_columns, 512u);
                 panel_columns = 64;
+#if defined(__aarch64__) || defined(_M_ARM64)
+                if (static_cast<uint64_t>(output_columns)
+                    >= static_cast<uint64_t>(team_size) * 128u)
+                {
+                    // Wider panels reduce repeated input-panel work and keep workers busy.
+                    panel_columns = 128;
+                }
+#endif
                 use_blas = true;
             }
         }
@@ -486,7 +495,11 @@ static bool bfloat16_linear_gemm_tile_into(const TensorData& matrix,
                 const uint32_t first_output = static_cast<uint32_t>(g) * panel_columns;
                 const uint32_t valid_outputs = std::min(panel_columns, output_columns - first_output);
 #if defined(__APPLE__) && TARGET_OS_OSX && defined(__MAC_15_0)
+#if defined(__aarch64__) || defined(_M_ARM64)
+                alignas(64) float packed[128 * 512];
+#else
                 alignas(64) float packed[64 * 512];
+#endif
 #else
                 alignas(64) float packed[8 * 2048];
 #endif
@@ -616,113 +629,157 @@ static uint32_t float8_linear_row_group_size_for_shape(const TensorData& matrix,
     return std::max(8u, kernel_group);
 }
 
-bool forward_linear_pair(const TensorData& first,
-                         const TensorData& second,
-                         const ActivationBuffer& input,
-                         ActivationBuffer& first_output,
-                         ActivationBuffer& second_output,
-                         uint64_t optimization_flags,
-                         const CompiledOperator* first_op,
-                         const CompiledOperator* second_op,
-                         ActivationBuffer* quantized_input_scratch)
+bool forward_linear(std::initializer_list<const TensorData*> matrices,
+                    const ActivationBuffer& input,
+                    std::initializer_list<ActivationBuffer*> outputs,
+                    uint64_t optimization_flags,
+                    std::initializer_list<const CompiledOperator*> ops,
+                    ActivationBuffer* quantized_input_scratch)
 {
-    assert(!quantized_input_scratch
-           || (quantized_input_scratch != &input
-               && quantized_input_scratch != &first_output
-               && quantized_input_scratch != &second_output));
-    if (quantized_input_scratch == &input
-        || quantized_input_scratch == &first_output
-        || quantized_input_scratch == &second_output)
-        quantized_input_scratch = nullptr;
-#if defined(__aarch64__) || defined(_M_ARM64)
-    const bool use_bfloat16 = first.dtype == DType::BFloat16
-                              && second.dtype == DType::BFloat16;
-#else
-    constexpr bool use_bfloat16 = false;
-#endif
-    const bool use_float8 = first.dtype == DType::Float8E4M3
-                            && second.dtype == DType::Float8E4M3;
-    if (!use_bfloat16
-        && (!use_float8 || !cpu_float8_fused_projections_enabled(optimization_flags)))
-        return false;
-
-    const uint32_t input_columns = input.columns();
-    if (input.dtype() != DType::Float32
-        || first_output.dtype() != DType::Float32
-        || second_output.dtype() != DType::Float32
-        || &input == &first_output
-        || &input == &second_output
-        || &first_output == &second_output
-        || first.shape.size() != 2
-        || second.shape.size() != 2
-        || first.shape[1] != input_columns
-        || second.shape[1] != input_columns
-        || (first_op && (first_op->linear || first_op->bfloat16 || first_op->float8 || first_op->qnk))
-        || (second_op && (second_op->linear || second_op->bfloat16 || second_op->float8 || second_op->qnk))
-        || !dense_host_storage_available(first)
-        || !dense_host_storage_available(second))
+    const size_t matrix_count = matrices.size();
+    if ((matrix_count != 2 && matrix_count != 4)
+        || outputs.size() != matrix_count
+        || (ops.size() != 0 && ops.size() != matrix_count))
     {
         return false;
     }
+
+    const TensorData* const* weights = matrices.begin();
+    ActivationBuffer* const* result = outputs.begin();
+    const CompiledOperator* const* owners = ops.size() == 0 ? nullptr : ops.begin();
+    for (size_t i = 0; i < matrix_count; ++i)
+    {
+        if (!weights[i] || !result[i])
+            return false;
+    }
+
+    if (input.dtype() != DType::Float32)
+        return false;
+    for (size_t i = 0; i < matrix_count; ++i)
+    {
+        if (result[i]->dtype() != DType::Float32
+            || result[i] == &input
+            || (quantized_input_scratch && result[i] == quantized_input_scratch))
+        {
+            return false;
+        }
+        for (size_t j = 0; j < i; ++j)
+        {
+            if (result[i] == result[j])
+                return false;
+        }
+    }
+    if (quantized_input_scratch == &input)
+        return false;
+
+    const DType dtype = weights[0]->dtype;
+    bool use_bfloat16 = false;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    use_bfloat16 = dtype == DType::BFloat16;
+#endif
+    const bool use_float8 = dtype == DType::Float8E4M3;
+    if (!use_bfloat16
+        && (!use_float8 || !cpu_float8_fused_projections_enabled(optimization_flags)))
+    {
+        return false;
+    }
+
+    const uint32_t input_columns = input.columns();
+    for (size_t i = 0; i < matrix_count; ++i)
+    {
+        const TensorData& matrix = *weights[i];
+        const CompiledOperator* op = owners ? owners[i] : nullptr;
+        if (matrix.dtype != dtype
+            || matrix.shape.size() != 2
+            || matrix.shape[1] != input_columns
+            || (op && (op->linear || op->bfloat16 || op->float8 || op->qnk))
+            || !dense_host_storage_available(matrix))
+        {
+            return false;
+        }
+    }
+    if (use_float8 && quantized_input_scratch
+        && quantized_input_scratch->dtype() != DType::Float32)
+    {
+        return false;
+    }
+
     constexpr uint32_t block_size = 128;
-    const uint32_t input_blocks = (input_columns + block_size - 1) / block_size;
-    uint32_t row_group_size = 0;
-    int team_size = 1;
+    const uint32_t input_blocks = input_columns / block_size
+                                  + (input_columns % block_size != 0);
+    uint32_t row_group_size = 8;
+    uint64_t workload = 0;
     if (use_bfloat16)
     {
-        if (input.rows() != 1
-            || first.shape[0] < 2 || second.shape[0] < 2
-            || input_columns < 16)
-        {
+        if (input.rows() != 1 || input_columns < 16)
             return false;
+        const uint64_t max_elements = input_columns <= 1024
+                                          ? 4u * 1024u * 1024u
+                                          : 512u * 1024u;
+        for (size_t i = 0; i < matrix_count; ++i)
+        {
+            if (weights[i]->shape[0] < 2
+                || weights[i]->element_count() > max_elements)
+            {
+                return false;
+            }
         }
 
-        const size_t max_elements = input_columns <= 1024
-                                        ? 4u * 1024u * 1024u
-                                        : 512u * 1024u;
-        if (first.element_count() > max_elements
-            || second.element_count() > max_elements)
+        for (size_t i = 0; i < matrix_count; ++i)
         {
-            return false;
+            const uint64_t elements = weights[i]->element_count();
+            if (matrix_count == 2)
+                workload = std::max(workload, elements);
+            else if (workload > std::numeric_limits<uint64_t>::max() - elements)
+                workload = std::numeric_limits<uint64_t>::max();
+            else
+                workload += elements;
         }
-
-        row_group_size = 8;
-        team_size = cpu_linear_team_size(std::max(first.element_count(), second.element_count()),
-                                         DType::BFloat16);
     }
     else
     {
-        const uint32_t first_output_blocks = (first.shape[0] + block_size - 1) / block_size;
-        const uint32_t second_output_blocks = (second.shape[0] + block_size - 1) / block_size;
-        if (first.float8_values().size() != first.element_count()
-            || second.float8_values().size() != second.element_count()
-            || first.quantization_scales.size()
-                   != static_cast<size_t>(first_output_blocks) * input_blocks
-            || second.quantization_scales.size()
-                   != static_cast<size_t>(second_output_blocks) * input_blocks)
-        {
-            return false;
-        }
-
         row_group_size = float8_linear_row_group_size(optimization_flags);
-        uint64_t operation_count = static_cast<uint64_t>(first.shape[0]) * input_columns
-                                   * input.rows();
-        const uint64_t second_operations = static_cast<uint64_t>(second.shape[0]) * input_columns
-                                           * input.rows();
-        if (operation_count > std::numeric_limits<uint64_t>::max()
-                                  - second_operations)
+        for (size_t i = 0; i < matrix_count; ++i)
         {
-            operation_count = std::numeric_limits<uint64_t>::max();
+            const TensorData& matrix = *weights[i];
+            const uint32_t output_blocks = matrix.shape[0] / block_size
+                                           + (matrix.shape[0] % block_size != 0);
+            const uint64_t scale_count = static_cast<uint64_t>(output_blocks) * input_blocks;
+            if (matrix.float8_values().size() != matrix.element_count()
+                || matrix.quantization_scales.size() != scale_count)
+            {
+                return false;
+            }
+
+            uint64_t operations = matrix.shape[0];
+            if (input_columns != 0
+                && operations > std::numeric_limits<uint64_t>::max() / input_columns)
+            {
+                operations = std::numeric_limits<uint64_t>::max();
+            }
+            else
+                operations *= input_columns;
+            if (input.rows() != 0
+                && operations > std::numeric_limits<uint64_t>::max() / input.rows())
+            {
+                operations = std::numeric_limits<uint64_t>::max();
+            }
+            else
+                operations *= input.rows();
+            if (workload > std::numeric_limits<uint64_t>::max() - operations)
+                workload = std::numeric_limits<uint64_t>::max();
+            else
+                workload += operations;
         }
-        else
-        {
-            operation_count += second_operations;
-        }
-        team_size = cpu_linear_team_size(operation_count, DType::Float8E4M3);
     }
 
-    first_output.reset(input.rows(), first.shape[0], false);
-    second_output.reset(input.rows(), second.shape[0], false);
+    const int team_size = cpu_linear_team_size(workload, dtype);
+    if (matrix_count == 4 && team_size == 1)
+        return false;
+
+    for (size_t i = 0; i < matrix_count; ++i)
+        result[i]->reset(input.rows(), weights[i]->shape[0], false);
+
     ActivationBuffer local_quantized_input;
     ActivationBuffer* quantized_input = nullptr;
     if (use_float8)
@@ -733,47 +790,61 @@ bool forward_linear_pair(const TensorData& first,
         prepare_quantized_float8_input(*quantized_input, input, optimization_flags);
     }
 
-    const int64_t first_groups = (static_cast<int64_t>(first.shape[0]) + row_group_size - 1)
-                                 / row_group_size;
-    const int64_t second_groups = (static_cast<int64_t>(second.shape[0]) + row_group_size - 1)
-                                  / row_group_size;
-    const int64_t groups = first_groups + second_groups;
-    std::span<const uint16_t> first_bfloat16;
-    std::span<const uint16_t> second_bfloat16;
+    std::array<int64_t, 5> group_offsets{};
+    for (size_t i = 0; i < matrix_count; ++i)
+    {
+        const int64_t rows = weights[i]->shape[0];
+        const int64_t group_count = (rows + row_group_size - 1) / row_group_size;
+        group_offsets[i + 1] = group_offsets[i] + group_count;
+    }
+    const int64_t groups = group_offsets[matrix_count];
+    std::array<std::span<const uint16_t>, 4> bfloat16{};
     if (use_bfloat16)
     {
-        first_bfloat16 = first.bfloat16_values();
-        second_bfloat16 = second.bfloat16_values();
+        for (size_t i = 0; i < matrix_count; ++i)
+            bfloat16[i] = weights[i]->bfloat16_values();
     }
-#pragma omp parallel for schedule(static) num_threads(team_size) if (team_size > 1)
-    for (int64_t group = 0; group < groups; ++group)
-    {
-        const bool first_matrix = group < first_groups;
-        const TensorData& matrix = first_matrix ? first : second;
-        ActivationBuffer& output = first_matrix ? first_output : second_output;
-        const uint32_t group_index = static_cast<uint32_t>(first_matrix ? group : group - first_groups);
-        const uint32_t first_output_column = group_index * row_group_size;
+    const auto forward = [&](int64_t group) {
+        size_t matrix_index = 0;
+        while (matrix_index + 1 < matrix_count
+               && group >= group_offsets[matrix_index + 1])
+        {
+            ++matrix_index;
+        }
+        const uint32_t group_index = static_cast<uint32_t>(group - group_offsets[matrix_index]);
+        const uint32_t first_output = group_index * row_group_size;
         const uint32_t group_size = std::min(row_group_size,
-                                             matrix.shape[0] - first_output_column);
+                                             weights[matrix_index]->shape[0] - first_output);
+        ActivationBuffer& output = *result[matrix_index];
         if (use_bfloat16)
         {
-            const std::span<const uint16_t> weights = first_matrix ? first_bfloat16 : second_bfloat16;
-            bfloat16_gemm_4x8(weights.data()
-                                  + static_cast<size_t>(first_output_column) * input_columns,
+            bfloat16_gemm_4x8(bfloat16[matrix_index].data()
+                                  + static_cast<size_t>(first_output) * input_columns,
                               input_columns,
                               input.row(0),
                               input_columns,
                               input_columns,
                               group_size,
                               1,
-                              output.row(0) + first_output_column,
+                              output.row(0) + first_output,
                               output.columns());
         }
         else
         {
-            float8_linear_group_into(matrix, *quantized_input, output, first_output_column,
+            float8_linear_group_into(*weights[matrix_index], *quantized_input, output, first_output,
                                      group_size, input_blocks, block_size, optimization_flags);
         }
+    };
+    if (team_size == 1)
+    {
+        for (int64_t group = 0; group < groups; ++group)
+            forward(group);
+    }
+    else
+    {
+#pragma omp parallel for schedule(static) num_threads(team_size)
+        for (int64_t group = 0; group < groups; ++group)
+            forward(group);
     }
     return true;
 }
@@ -916,7 +987,6 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
     const int64_t parallel_output_columns = static_cast<int64_t>(output_columns);
     const uint64_t operation_count = static_cast<uint64_t>(output_columns) * input_columns * input.rows();
     const int linear_team_size = cpu_linear_team_size(operation_count, matrix.dtype);
-    const bool parallelize_linear = linear_team_size > 1;
 #if defined(NCNN_MOE_MSVC_X86_SIMD)                \
     || ((defined(__x86_64__) || defined(__i386__)) \
         && (defined(__GNUC__) || defined(__clang__)))
@@ -948,24 +1018,28 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
     if (matrix.dtype == DType::Float32)
     {
         const std::span<const float> matrix_values = matrix.float32_values();
-#pragma omp parallel for num_threads(linear_team_size) if (parallelize_linear)
-        for (int64_t output_column = 0; output_column < parallel_output_columns; ++output_column)
-        {
+        const auto forward = [&](int64_t output_column) {
             const float* weights = matrix_values.data() + static_cast<size_t>(output_column) * input_columns;
             for (size_t token_index = 0; token_index < input.rows(); ++token_index)
             {
                 const float* token = input.row(token_index);
                 output.row(token_index)[output_column] = float_dot(weights, token, input_columns);
             }
+        };
+        if (linear_team_size == 1)
+        {
+            for (int64_t output_column = 0; output_column < parallel_output_columns; ++output_column)
+                forward(output_column);
+            return;
         }
+#pragma omp parallel for num_threads(linear_team_size)
+        for (int64_t output_column = 0; output_column < parallel_output_columns; ++output_column)
+            forward(output_column);
     }
     else if (matrix.dtype == DType::BFloat16)
     {
         const std::span<const uint16_t> matrix_values = matrix.bfloat16_values();
-#pragma omp parallel for num_threads(linear_team_size) if (parallelize_linear)
-        for (int64_t output_column = 0;
-             output_column < parallel_output_columns; ++output_column)
-        {
+        const auto forward = [&](int64_t output_column) {
             const uint16_t* weights = matrix_values.data()
                                       + static_cast<size_t>(output_column) * input_columns;
             for (size_t token_index = 0; token_index < input.rows(); ++token_index)
@@ -973,7 +1047,17 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
                 const float* token = input.row(token_index);
                 output.row(token_index)[output_column] = bfloat16_dot(weights, token, input_columns);
             }
+        };
+        if (linear_team_size == 1)
+        {
+            for (int64_t output_column = 0; output_column < parallel_output_columns; ++output_column)
+                forward(output_column);
+            return;
         }
+#pragma omp parallel for num_threads(linear_team_size)
+        for (int64_t output_column = 0;
+             output_column < parallel_output_columns; ++output_column)
+            forward(output_column);
     }
     else if (matrix.dtype == DType::Float8E4M3)
     {
@@ -987,9 +1071,7 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
     else if (matrix.dtype == DType::Int8)
     {
         const std::span<const int8_t> matrix_values = matrix.int8_values();
-#pragma omp parallel for num_threads(linear_team_size) if (parallelize_linear)
-        for (int64_t output_column = 0; output_column < parallel_output_columns; ++output_column)
-        {
+        const auto forward = [&](int64_t output_column) {
             const int8_t* weights = matrix_values.data() + static_cast<size_t>(output_column) * input_columns;
             const float scale = matrix.quantization_scales[output_column];
             for (size_t token_index = 0; token_index < input.rows(); ++token_index)
@@ -997,7 +1079,16 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
                 const float* token = input.row(token_index);
                 output.row(token_index)[output_column] = int8_float_dot(weights, token, input_columns) * scale;
             }
+        };
+        if (linear_team_size == 1)
+        {
+            for (int64_t output_column = 0; output_column < parallel_output_columns; ++output_column)
+                forward(output_column);
+            return;
         }
+#pragma omp parallel for num_threads(linear_team_size)
+        for (int64_t output_column = 0; output_column < parallel_output_columns; ++output_column)
+            forward(output_column);
     }
     else if (matrix.dtype == DType::MxFp4)
     {
@@ -1036,7 +1127,7 @@ void forward_linear(const TensorData& matrix, const ActivationBuffer& input, Act
                 }
             }
         }
-#pragma omp parallel for num_threads(linear_team_size) if (parallelize_linear)
+#pragma omp parallel for num_threads(linear_team_size) if (linear_team_size > 1)
         for (int64_t row_pair = 0; row_pair < row_pair_count; ++row_pair)
         {
             const uint32_t first_row = static_cast<uint32_t>(row_pair) * 2;
@@ -2607,17 +2698,6 @@ void add_batch_inplace(ActivationBuffer& destination, const ActivationBuffer& so
         const float* input = source.row(row_index);
         float_scaled_add(output, input, 1.0f, destination.columns());
     }
-}
-
-std::vector<std::vector<float>> batch_to_vectors(const ActivationBuffer& batch)
-{
-    std::vector<std::vector<float>> output(batch.rows());
-    if (batch.columns() == 0)
-        return output;
-    for (size_t row_index = 0; row_index < batch.rows(); ++row_index)
-        output[row_index].assign(batch.row(row_index),
-                                 batch.row(row_index) + batch.columns());
-    return output;
 }
 
 } // namespace moe

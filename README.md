@@ -246,11 +246,13 @@ validated AVX2 kernels for the remaining formats. The scalar decoder remains
 the portability and correctness fallback.
 
 `--cpu-packed-weights on` explicitly enables lazy in-memory repacking for
-supported Qn_K and MXFP4-Q8 CPU Expert weights. The default is `off`; there is
-no automatic mode. When enabled, the memory planner and on-demand Expert cache
-reserve the additional sidecar bytes before loading. Repack can help some
+supported Qn_K and MXFP4-Q8 CPU Expert weights. Canonical BF16 weights use the
+runtime's BF16 GEMM and dot-product kernels. The default is `off`; there is no
+automatic mode. When enabled, the memory planner and on-demand Expert cache
+reserve the additional packed bytes before loading. Repacking can help some
 batched shapes but increases resident memory and is not assumed to improve
-single-token decode, so benchmark it on the target machine before enabling it.
+single-token decode for every format, so benchmark it on the target machine
+before enabling it.
 
 The deterministic Qn_K reference comparison can be run from the CPU test
 binary:
@@ -312,8 +314,13 @@ implementation switches (`OptimizationCpuSimdRmsNorm`,
 `OptimizationCpuLatentSimdNorm`, `OptimizationCpuGatedDeltaSimd`,
 `OptimizationCpuMxfp4RowPairs`, and `OptimizationCpuLatentOutputGroups`) have
 been removed. C++ callers should remove references to those constants; the
-remaining optimization flags retain their numeric values. Precision, packed
-weight storage, and backend controls remain explicit options.
+remaining optimization flags retain their numeric values. CPU RoPE coefficient
+reuse and Vulkan command recording optimizations are also automatic. The
+`OptimizationCpuRopeCache`, `OptimizationVulkanPipelineBindElision`,
+`OptimizationVulkanReadonlyBindings`, `OptimizationVulkanBatchBufferBarriers`,
+`OptimizationVulkanStackDescriptorPayload`, and unused
+`OptimizationVulkanExpertEagerAdmission` constants have been removed.
+Precision, packed weight storage, and backend controls remain explicit options.
 
 Statistics retain execution, fusion, transfer, cache, and CPU-fallback results.
 The per-stage Vulkan Attention failure fields (`vulkan_attention_*_failures`)
@@ -398,11 +405,14 @@ implements ARC recent/frequent resident lists and ghost histories.
 
 Model CPU Linear execution uses the runtime's CPU kernels. Model preparation
 does not create duplicate ncnn CPU layers or FP32-expanded weight copies;
-weight-owned lazy packed caches remain available. The low-level
-`OptimizationNcnnCpuBfloat16Linear` flag still controls direct ncnn operator
-construction, not model CPU kernel selection. Reference runners report
-`CPU Linear backend: moe-kernels`; benchmark metadata uses `cpu_linear_backend`
-instead of the former `cpu_small_bfloat16_linear_policy` field.
+weight-owned lazy packed caches remain available. The unused CPU layer wrapper
+and `OptimizationNcnnCpuBfloat16Linear` constant have been removed. Reference
+runners report `CPU Linear backend: moe-kernels`; benchmark metadata uses
+`cpu_linear_backend`.
+
+Bundled ncnn builds the layers required by the Runtime and Mat conversions.
+Its exported SDK uses the same layer set; direct `ncnn::Net` consumers need a
+build containing the layers required by their own models.
 
 Autoregressive dependencies are preserved within each Session. Independent
 Sessions can overlap through explicit batch submissions. Multi-Session prefill

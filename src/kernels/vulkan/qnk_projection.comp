@@ -160,7 +160,7 @@ float qnk_value(uint block, uint type, uint index)
         const uint low = (group < 2u) ? qnk_byte(low_index) & 15u : qnk_byte(low_index) >> 4u;
         const uint value = low | (((qnk_byte(high_index) >> (group * 2u)) & 3u) << 4u);
         const int signed_value = int(value) - 32;
-        const int scale = qnk_signed_byte(qnk_byte(block + 192u + super * 8u + group * 2u));
+        const int scale = qnk_signed_byte(qnk_byte(block + 192u + super * 8u + group * 2u + (lane >> 4u)));
         return qnk_f16(block + 208u) * float(scale * signed_value);
     }
 

@@ -719,6 +719,8 @@ Result<uint64_t> ExpertCache::stored_size(const TensorData& tensor)
 
 Result<uint64_t> ExpertCache::packed_weight_size(const TensorData& tensor)
 {
+    if (tensor.dtype == DType::BFloat16 && tensor.shape.size() == 2)
+        return uint64_t{0};
     if (tensor.dtype != DType::MxFp4 || tensor.shape.size() != 2)
         return Error{ErrorCode::InvalidArgument, "packed Expert reservation requires an MXFP4 matrix"};
     const uint64_t rows = tensor.shape[0];
@@ -2294,8 +2296,6 @@ Result<ExpertCacheLease> ExpertCache::acquire_pair(const TensorData& gate_up,
     lease.down = entry->down;
     lease.gate_up_operator = &entry->gate_up_operator;
     lease.down_operator = &entry->down_operator;
-    lease.cache_hit = cache_hit;
-    lease.bytes_read = cache_hit ? 0 : entry->stored_size;
     lease.pin = entry;
     return lease;
 }
@@ -2364,8 +2364,6 @@ Result<bool> ExpertCache::try_acquire_ready_pairs(std::span<const ExpertCachePai
         lease.down = entry->down;
         lease.gate_up_operator = &entry->gate_up_operator;
         lease.down_operator = &entry->down_operator;
-        lease.cache_hit = cache_hit;
-        lease.bytes_read = cache_hit ? 0 : entry->stored_size;
         lease.pin = entry;
     }
     return true;
@@ -2522,8 +2520,6 @@ Result<size_t> ExpertCache::wait_acquire_ready_pairs(std::span<const ExpertCache
         lease.down = entry->down;
         lease.gate_up_operator = &entry->gate_up_operator;
         lease.down_operator = &entry->down_operator;
-        lease.cache_hit = cache_hit;
-        lease.bytes_read = cache_hit ? 0 : entry->stored_size;
         lease.pin = entry;
         ++acquired;
     }

@@ -43,7 +43,7 @@ static float half_to_float(uint16_t value) noexcept
         if (mantissa != 0)
         {
             uint32_t normalized = mantissa;
-            int32_t exponent_shift = -1;
+            int32_t exponent_shift = 0;
             while ((normalized & 0x0400u) == 0)
             {
                 normalized <<= 1;
@@ -381,10 +381,10 @@ static float dot_q6_block(const uint8_t* block, const float* input) noexcept
             const __m128i q2 = q6_values(second_low, high, 0, 2);
             const __m128i q3 = q6_values(first_low, high, 4, 4);
             const __m128i q4 = q6_values(second_low, high, 4, 6);
-            sum += d * static_cast<float>(scales[0]) * dot_q6_u8x8(q1, first_input);
-            sum += d * static_cast<float>(scales[2]) * dot_q6_u8x8(q2, second_input);
-            sum += d * static_cast<float>(scales[4]) * dot_q6_u8x8(q3, third_input);
-            sum += d * static_cast<float>(scales[6]) * dot_q6_u8x8(q4, fourth_input);
+            sum += d * static_cast<float>(scales[lane / 16]) * dot_q6_u8x8(q1, first_input);
+            sum += d * static_cast<float>(scales[lane / 16 + 2]) * dot_q6_u8x8(q2, second_input);
+            sum += d * static_cast<float>(scales[lane / 16 + 4]) * dot_q6_u8x8(q3, third_input);
+            sum += d * static_cast<float>(scales[lane / 16 + 6]) * dot_q6_u8x8(q4, fourth_input);
         }
     }
     return sum;

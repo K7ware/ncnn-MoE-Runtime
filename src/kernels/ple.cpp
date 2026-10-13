@@ -2,9 +2,12 @@
 
 #include "attention.h"
 #include "fastmath.h"
+#include "graph/compiledoperator.h"
 #include "ops.h"
 #include "statecache.h"
+#include "ncnn/moe/modeldescriptor.h"
 #include "ncnn/moe/option.h"
+#include "storage/weightstore.h"
 
 #include <algorithm>
 #include <bit>
@@ -78,11 +81,9 @@ static Result<const uint16_t*> embedding_row(const WeightStore& weights,
 }
 
 Result<void> forward_ple(const WeightStore& weights,
+                         const CompiledOperatorTable& operators,
                          const PleBlockPlan& plan,
-                         uint32_t multiplier,
-                         uint32_t hidden_size,
-                         float norm_epsilon,
-                         float norm_weight_offset,
+                         const MoeModelDescriptor& descriptor,
                          std::span<const int32_t> input_ids,
                          LayerCache& cache,
                          AttentionScratch& scratch,
@@ -91,6 +92,10 @@ Result<void> forward_ple(const WeightStore& weights,
 {
     if (!plan.enabled())
         return {};
+    const uint32_t multiplier = descriptor.hyper_connection_multiplier;
+    const uint32_t hidden_size = descriptor.hidden_size;
+    const float norm_epsilon = descriptor.norm_epsilon;
+    const float norm_weight_offset = descriptor.norm_weight_offset;
     const uint32_t expanded_size = multiplier * hidden_size;
     const uint32_t head_count = (plan.ngram_size - 1) * plan.heads_per_ngram;
     if (multiplier == 0 || hidden.rows() != input_ids.size()
@@ -166,8 +171,16 @@ Result<void> forward_ple(const WeightStore& weights,
 
     ActivationBuffer& key = scratch.key;
     ActivationBuffer& value = scratch.value;
-    forward_linear(weights.at(plan.key_weight), embeddings, key, flags);
-    forward_linear(weights.at(plan.value_weight), embeddings, value, flags);
+    forward_linear(weights.at(plan.key_weight),
+                   embeddings,
+                   key,
+                   flags,
+                   operators.find_weight(plan.key_weight));
+    forward_linear(weights.at(plan.value_weight),
+                   embeddings,
+                   value,
+                   flags,
+                   operators.find_weight(plan.value_weight));
     ActivationBuffer& key_normed = scratch.query;
     ActivationBuffer& query_normed = scratch.gate;
     forward_grouped_rms_norm(key, weights.at(plan.key_norm_weight), hidden_size,

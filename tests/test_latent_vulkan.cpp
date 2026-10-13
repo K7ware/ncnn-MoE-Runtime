@@ -523,7 +523,7 @@ static bool latent_forward_record(const std::shared_ptr<LatentAttention_vulkan>&
 {
     const auto& context = core->vulkan_context();
     const std::lock_guard<std::mutex> lock(context->command_mutex());
-    ncnn::VkCompute cmd(context->device(), context->command_optimization_flags());
+    ncnn::VkCompute cmd(context->device());
     ncnn::VkMat input_staging;
     ncnn::VkMat device_input;
     ncnn::VkMat device_output;
@@ -794,7 +794,7 @@ static void latent_test_end_to_end(uint32_t ratio, bool record_path = false)
                 CompiledOperator& index_weights_operator = alias_operators.at_weight_mutable(plan.indexer_weights_weight);
                 index_weights_operator.bfloat16.reset();
                 index_weights_operator.linear = Linear::create(weights.at(plan.indexer_weights_weight), nullptr,
-                                                               LinearDevice::Vulkan, get_default_gpu_index(), runtime, flags);
+                                                               get_default_gpu_index(), runtime, flags);
                 latent_check(static_cast<bool>(index_weights_operator.linear), "compile generic GPU index weight projection");
                 auto alias_core = LatentAttention_vulkan::create(alias_plan, weights.at(plan.sinks),
                                                                  operators.at_weight(plan.output_a_weight).float8,

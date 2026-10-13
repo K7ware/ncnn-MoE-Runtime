@@ -30,7 +30,7 @@ static std::shared_ptr<Linear> combine_seed(const VulkanRuntimePtr& runtime, uin
     matrix.shape = {columns, columns};
     matrix.float32_data.assign(static_cast<size_t>(columns) * columns, 0.0f);
     for (uint32_t i = 0; i < columns; ++i) matrix.float32_data[static_cast<size_t>(i) * columns + i] = 1.0f;
-    auto result = Linear::create(matrix, nullptr, LinearDevice::Vulkan, get_default_gpu_index(), runtime, combine_flags);
+    auto result = Linear::create(matrix, nullptr, get_default_gpu_index(), runtime, combine_flags);
     combine_check(static_cast<bool>(result), "GPU seed creation");
     return result;
 }
@@ -238,7 +238,7 @@ static void combine_test_deferred_ownership()
         const std::lock_guard<std::mutex> lock(context->command_mutex());
         std::vector<ncnn::VkMat> storage;
         uint64_t uploads = 0;
-        ncnn::VkCompute command(context->device(), context->command_optimization_flags());
+        ncnn::VkCompute command(context->device());
         ncnn::VkMat output;
         combine_check(combiner->record(*pending, output, command, storage, uploads), "record deferred sum without submitting");
         combine_check(uploads == 2 && !output.empty(), "only owned host Expert and Shared activations upload");
@@ -249,7 +249,7 @@ static void combine_test_deferred_ownership()
         const std::lock_guard<std::mutex> lock(context->command_mutex());
         std::vector<ncnn::VkMat> storage;
         uint64_t uploads = 0;
-        ncnn::VkCompute command(context->device(), context->command_optimization_flags());
+        ncnn::VkCompute command(context->device());
         ncnn::VkMat output;
         combine_check(!foreign_combiner->record(*pending, output, command, storage, uploads) && output.empty() && uploads == 0,
                       "foreign recorder rejects without recording");
