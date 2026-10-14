@@ -149,22 +149,26 @@ the model-specific reference runners or the MXFP4 microbenchmark unless they
 are explicitly enabled. MSVC builds use multiprocessor compilation by default;
 set `-DNCNN_MOE_ENABLE_MSVC_MP=OFF` only when a toolchain does not support it.
 
-For the full development and CTest targets, use a separate build directory:
+For the full development and CTest targets, use a separate build directory.
+The style test requires clang-format 10+ on PATH in addition to Python 3.10+.
+Build all targets before running CTest; building only `ncnn_moe_tests` leaves
+the other test executables unavailable.
 
 ```powershell
+clang-format --version
 cmake -S . -B build-test `
   -DNCNN_MOE_BUILD_TESTS=ON `
-  -DNCNN_MOE_BUILD_REFERENCE_RUNNERS=ON `
-cmake --build build-test --config Release `
-  --target ncnn_moe_tests ncnn_moe_worker ncnn_moe_gpt_oss --parallel
+  -DNCNN_MOE_BUILD_REFERENCE_RUNNERS=ON
+cmake --build build-test --config Release --parallel
 ctest --test-dir build-test -C Release --output-on-failure
 ```
 
 For a single-config generator:
 
 ```sh
+clang-format --version
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNCNN_MOE_BUILD_TESTS=ON
-cmake --build build --target ncnn_moe_tests ncnn_moe_worker --parallel
+cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
