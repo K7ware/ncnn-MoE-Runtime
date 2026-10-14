@@ -236,10 +236,10 @@ static float dot_q6_block_direct(const uint8_t* block, const float* input) noexc
             const float* second_input = first_input + 32;
             const float* third_input = first_input + 64;
             const float* fourth_input = first_input + 96;
-            sum += d * static_cast<float>(scales[0]) * dot_q6_u8x16(q6_values(first_low, high, 0, 0), first_input);
-            sum += d * static_cast<float>(scales[2]) * dot_q6_u8x16(q6_values(second_low, high, 0, 2), second_input);
-            sum += d * static_cast<float>(scales[4]) * dot_q6_u8x16(q6_values(first_low, high, 4, 4), third_input);
-            sum += d * static_cast<float>(scales[6]) * dot_q6_u8x16(q6_values(second_low, high, 4, 6), fourth_input);
+            sum += d * static_cast<float>(scales[lane / 16]) * dot_q6_u8x16(q6_values(first_low, high, 0, 0), first_input);
+            sum += d * static_cast<float>(scales[lane / 16 + 2]) * dot_q6_u8x16(q6_values(second_low, high, 0, 2), second_input);
+            sum += d * static_cast<float>(scales[lane / 16 + 4]) * dot_q6_u8x16(q6_values(first_low, high, 4, 4), third_input);
+            sum += d * static_cast<float>(scales[lane / 16 + 6]) * dot_q6_u8x16(q6_values(second_low, high, 4, 6), fourth_input);
         }
     }
     return sum;
