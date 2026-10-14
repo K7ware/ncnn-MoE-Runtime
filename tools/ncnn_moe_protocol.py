@@ -1,7 +1,4 @@
-"""Client for the ncnn_moe_worker stdio JSONL protocol.
-
-Startup ``init`` events are consumed before the first ``ready`` event.
-"""
+"""Client for the ncnn_moe_worker stdio JSONL protocol."""
 
 from __future__ import annotations
 
@@ -23,7 +20,7 @@ EventCallback = Callable[[dict[str, Any]], None]
 
 
 class WorkerClient:
-    """Synchronous JSONL client; generation itself runs asynchronously in C++."""
+    """Strict UTF-8 JSONL client; generation runs asynchronously in C++."""
 
     def __init__(
         self,
@@ -31,7 +28,6 @@ class WorkerClient:
         model: Path,
         runtime_args: Iterable[str] = (),
         *,
-        startup_callback: EventCallback | None = None,
         verbose: bool = False,
     ) -> None:
         self.worker = Path(worker).resolve()
@@ -47,23 +43,17 @@ class WorkerClient:
             stderr=None if verbose else subprocess.DEVNULL,
             text=True,
             encoding="utf-8",
-            errors="replace",
+            errors="strict",
             bufsize=1,
         )
         self._closed = False
         try:
-            while True:
-                ready = self._read_event()
-                if ready.get("event") == "init":
-                    if startup_callback is not None:
-                        startup_callback(ready)
-                    continue
-                if ready.get("event") == "error":
-                    raise WorkerError(ready.get("message", "worker failed to load the model"), ready)
-                if ready.get("event") != "ready":
-                    raise WorkerError(f"worker did not send ready event: {ready}", ready)
-                self.ready = ready
-                break
+            ready = self._read_event()
+            if ready.get("event") == "error":
+                raise WorkerError(ready.get("message", "worker failed to load the model"), ready)
+            if ready.get("event") != "ready":
+                raise WorkerError(f"worker did not send ready event: {ready}", ready)
+            self.ready = ready
         except BaseException:
             self._terminate()
             raise
@@ -75,24 +65,29 @@ class WorkerClient:
     def _send(self, payload: dict[str, Any]) -> None:
         if self._closed or self._process.stdin is None:
             raise WorkerError("worker is closed")
-        self._process.stdin.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+        try:
+            self._process.stdin.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+        except UnicodeEncodeError as error:
+            raise WorkerError("worker request must contain valid UTF-8 text") from error
         self._process.stdin.flush()
 
     def _read_event(self) -> dict[str, Any]:
         if self._process.stdout is None:
             raise WorkerError("worker stdout is unavailable")
-        while True:
+        try:
             line = self._process.stdout.readline()
-            if not line:
-                return_code = self._process.poll()
-                raise WorkerError(f"worker exited before sending an event (return code {return_code})")
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise WorkerError(f"worker emitted invalid JSONL: {line.rstrip()!r}") from error
-            if not isinstance(event, dict):
-                raise WorkerError(f"worker event must be a JSON object: {event!r}")
-            return event
+        except UnicodeDecodeError as error:
+            raise WorkerError("worker emitted invalid UTF-8") from error
+        if not line:
+            return_code = self._process.poll()
+            raise WorkerError(f"worker exited before sending an event (return code {return_code})")
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise WorkerError(f"worker emitted invalid JSONL: {line.rstrip()!r}") from error
+        if not isinstance(event, dict):
+            raise WorkerError(f"worker event must be a JSON object: {event!r}")
+        return event
 
     @staticmethod
     def _raise_for_error(event: dict[str, Any]) -> None:
@@ -140,8 +135,11 @@ class WorkerClient:
     def generate(
         self,
         session_id: str,
-        prompt_tokens: list[int],
+        prompt_tokens: list[int] | None = None,
         *,
+        messages: list[dict[str, str]] | None = None,
+        enable_thinking: bool | None = None,
+        context_tokens: int | None = None,
         request_id: str = "generate",
         max_new_tokens: int = 1024,
         temperature: float = 0.0,
@@ -156,35 +154,50 @@ class WorkerClient:
         metrics_interval_ms: int = 1000,
         on_event: EventCallback | None = None,
     ) -> tuple[dict[str, Any], list[int]]:
-        self._send(
-            {
-                "op": "generate",
-                "request_id": request_id,
-                "session_id": session_id,
-                "prompt_tokens": prompt_tokens,
-                "max_new_tokens": max_new_tokens,
-                "temperature": temperature,
-                "top_k": top_k,
-                "top_p": top_p,
-                "min_p": min_p,
-                "stop_tokens": stop_tokens or [],
-                "enable_speculative": enable_speculative,
-                "speculative_confidence": speculative_confidence,
-                "speculative_max_draft": speculative_max_draft,
-                "metrics_enabled": metrics_enabled,
-                "metrics_interval_ms": metrics_interval_ms,
-            }
-        )
+        if (prompt_tokens is None) == (messages is None):
+            raise WorkerError("generate requires exactly one of prompt_tokens or messages")
+        payload: dict[str, Any] = {
+            "op": "generate",
+            "request_id": request_id,
+            "session_id": session_id,
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
+            "min_p": min_p,
+            "enable_speculative": enable_speculative,
+            "speculative_confidence": speculative_confidence,
+            "speculative_max_draft": speculative_max_draft,
+            "metrics_enabled": metrics_enabled,
+            "metrics_interval_ms": metrics_interval_ms,
+        }
+        if messages is None:
+            payload["prompt_tokens"] = prompt_tokens
+            if stop_tokens is not None:
+                payload["stop_tokens"] = stop_tokens
+        else:
+            payload["messages"] = messages
+            if enable_thinking is not None:
+                payload["enable_thinking"] = enable_thinking
+            if context_tokens is not None:
+                payload["context_tokens"] = context_tokens
+        self._send(payload)
         tokens: list[int] = []
+        callback_error: Exception | None = None
         try:
             while True:
                 event = self._read_event()
                 self._raise_for_error(event)
-                if on_event is not None:
-                    on_event(event)
+                if on_event is not None and callback_error is None:
+                    try:
+                        on_event(event)
+                    except Exception as error:
+                        callback_error = error
                 if event.get("event") == "token":
                     tokens.append(int(event["token_id"]))
                 elif event.get("event") == "done":
+                    if callback_error is not None:
+                        raise callback_error
                     return event, tokens
         except KeyboardInterrupt as error:
             # A synchronous client cannot call cancel() while it is reading a
@@ -195,8 +208,11 @@ class WorkerClient:
                 while True:
                     event = self._read_event()
                     self._raise_for_error(event)
-                    if on_event is not None:
-                        on_event(event)
+                    if on_event is not None and callback_error is None:
+                        try:
+                            on_event(event)
+                        except Exception as callback_exception:
+                            callback_error = callback_exception
                     if event.get("event") == "token":
                         tokens.append(int(event["token_id"]))
                     elif event.get("event") == "done":
@@ -210,19 +226,45 @@ class WorkerClient:
             {"op": "reset", "session_id": session_id}, expected="reset"
         )
 
-    def compact(self, session_id: str, replay_tokens: list[int]) -> dict[str, Any]:
+    def compact(
+        self,
+        session_id: str,
+        replay_tokens: list[int] | None = None,
+        *,
+        messages: list[dict[str, str]] | None = None,
+        enable_thinking: bool | None = None,
+        context_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        if (replay_tokens is None) == (messages is None):
+            raise WorkerError("compact requires exactly one of replay_tokens or messages")
+        payload: dict[str, Any] = {"op": "compact", "session_id": session_id}
+        if messages is None:
+            payload["replay_tokens"] = replay_tokens
+        else:
+            payload["messages"] = messages
+            if enable_thinking is not None:
+                payload["enable_thinking"] = enable_thinking
+            if context_tokens is not None:
+                payload["context_tokens"] = context_tokens
         return self.request(
-            {
-                "op": "compact",
-                "session_id": session_id,
-                "replay_tokens": replay_tokens,
-            },
+            payload,
             expected="compacted",
         )
 
-    def stats(self, session_id: str) -> dict[str, Any]:
+    def stats(
+        self,
+        session_id: str,
+        *,
+        messages: list[dict[str, str]] | None = None,
+        enable_thinking: bool | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"op": "stats", "session_id": session_id}
+        if messages is not None:
+            payload["messages"] = messages
+            if enable_thinking is not None:
+                payload["enable_thinking"] = enable_thinking
         return self.request(
-            {"op": "stats", "session_id": session_id}, expected="stats"
+            payload, expected="stats"
         )
 
     def cancel(self, request_id: str = "") -> dict[str, Any]:

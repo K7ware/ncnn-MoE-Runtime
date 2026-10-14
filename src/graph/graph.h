@@ -1,0 +1,132 @@
+#ifndef NCNN_MOE_GRAPH_H
+#define NCNN_MOE_GRAPH_H
+
+#include "ncnn/moe/result.h"
+#include "layerplan.h"
+#include "ncnn/moe/types.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <vector>
+
+namespace ncnn {
+namespace moe {
+
+struct CompiledModel;
+
+using ExecutionNodeId = uint32_t;
+using ExecutionTensorId = uint32_t;
+inline constexpr ExecutionNodeId invalid_execution_node_id = std::numeric_limits<ExecutionNodeId>::max();
+inline constexpr ExecutionTensorId invalid_execution_tensor_id = std::numeric_limits<ExecutionTensorId>::max();
+inline constexpr uint32_t invalid_execution_layer_id = std::numeric_limits<uint32_t>::max();
+inline constexpr uint32_t invalid_execution_expert_id = std::numeric_limits<uint32_t>::max();
+
+enum class ExecutionBackend
+{
+    Cpu,
+    Vulkan
+};
+
+enum class ExecutionNodeType
+{
+    TokenEmbedding,
+    Attention,
+    Router,
+    ExpertDispatch,
+    Expert,
+    ExpertGroup,
+    SharedExpertGroup,
+    Combine,
+    FinalNorm,
+    LmHead
+};
+
+#define NCNN_MOE_BACKEND_CPU_BIT    0
+#define NCNN_MOE_BACKEND_VULKAN_BIT 1
+
+enum ExecutionBackendMask : uint32_t
+{
+    ExecutionBackendCpu = UINT32_C(1) << NCNN_MOE_BACKEND_CPU_BIT,
+    ExecutionBackendVulkan = UINT32_C(1) << NCNN_MOE_BACKEND_VULKAN_BIT
+};
+
+#define NCNN_MOE_NODE_CONDITIONAL_BIT     0
+#define NCNN_MOE_NODE_CPU_PREFETCH_BIT    1
+#define NCNN_MOE_NODE_REQUEST_EXPERTS_BIT 2
+
+enum ExecutionNodeFlag : uint32_t
+{
+    ExecutionNodeConditional = UINT32_C(1) << NCNN_MOE_NODE_CONDITIONAL_BIT,
+    ExecutionNodeCpuPrefetch = UINT32_C(1) << NCNN_MOE_NODE_CPU_PREFETCH_BIT,
+    // Submit exact reads during dispatch, before independent shared CPU work.
+    ExecutionNodeRequestExperts = UINT32_C(1) << NCNN_MOE_NODE_REQUEST_EXPERTS_BIT
+};
+
+struct ExecutionTensor
+{
+    ExecutionTensorId id = invalid_execution_tensor_id;
+    std::string name;
+    DType dtype = DType::Float32;
+    std::vector<uint32_t> shape;
+    ExecutionNodeId producer = invalid_execution_node_id;
+    std::vector<ExecutionNodeId> consumers;
+};
+
+struct ExecutionNode
+{
+    ExecutionNodeId id = invalid_execution_node_id;
+    ExecutionNodeType type = ExecutionNodeType::TokenEmbedding;
+    ExecutionBackend backend = ExecutionBackend::Cpu;
+    uint32_t backend_mask = ExecutionBackendCpu;
+    // Index into ExecutionGraph::layer_plans.  The graph owns both execution
+    // order and the immutable layer payload consumed by the executor.
+    uint32_t layer_plan_index = invalid_execution_layer_id;
+    uint32_t expert_id = invalid_execution_expert_id;
+    // WeightStore handles consumed by non-layer nodes.  Layer nodes resolve
+    // their complete operator payload through layer_plan_index instead.
+    std::vector<TensorHandle> weight_inputs;
+    uint32_t flags = 0;
+    std::string name;
+    std::vector<ExecutionNodeId> dependencies;
+    std::vector<ExecutionTensorId> inputs;
+    std::vector<ExecutionTensorId> outputs;
+};
+
+struct ExecutionGraph
+{
+    std::vector<ExecutionTensor> tensors;
+    std::vector<ExecutionNode> nodes;
+    std::vector<CompiledLayerPlan> layer_plans;
+
+    [[nodiscard]] Result<void> validate() const;
+};
+
+struct ExecutionSchedule
+{
+    std::vector<ExecutionNodeId> node_order;
+
+    [[nodiscard]] Result<void> validate(const ExecutionGraph& graph) const;
+};
+
+struct GraphOption
+{
+    uint32_t available_backends = ExecutionBackendCpu;
+    bool prefer_vulkan_dense = true;
+};
+
+// Selects backends in place and fills caller-owned storage.  Callers provide
+// fresh, discardable graph and schedule objects when constructing a model;
+// discard the owning model on failure.
+[[nodiscard]] Result<void> schedule_graph(ExecutionGraph& graph,
+                                          ExecutionSchedule& schedule,
+                                          const GraphOption& options);
+
+// Build and schedule the target and speculative graph regions.
+[[nodiscard]] Result<void> build_graph(CompiledModel& compiled, bool use_vulkan_experts);
+
+} // namespace moe
+} // namespace ncnn
+
+#endif // NCNN_MOE_GRAPH_H

@@ -24,7 +24,6 @@ set(NCNN_MOE_USE_NCNN_DEFAULT ON)
 option(NCNN_MOE_USE_NCNN "Use ncnn optimized CPU operators when available" ${NCNN_MOE_USE_NCNN_DEFAULT})
 set(NCNN_MOE_USE_VULKAN_DEFAULT ON)
 option(NCNN_MOE_USE_VULKAN "Build ncnn with Vulkan support" ${NCNN_MOE_USE_VULKAN_DEFAULT})
-option(NCNN_MOE_ENABLE_EXPERIMENTAL_MACOS_VULKAN "Enable the experimental MoltenVK hybrid backend on macOS" ON)
 include(GNUInstallDirs)
 
 if(MSVC)
@@ -40,79 +39,126 @@ if(NOT NCNN_BUILD_MOE_RUNTIME)
 endif()
 
 set(NCNN_MOE_SOURCES
-    src/backends/ncnn/ncnn_linear.cpp
-    src/compiler/graph_builder.cpp
-    src/compiler/moe_graph.cpp
-    src/engine/cpu_executor.cpp
-    src/engine/cpu_features.cpp
-    src/engine/cpu_task_worker.cpp
-    src/engine/cpu_thread_budget.cpp
-    src/engine/cpu_topology.cpp
-    src/engine/expert_backend.cpp
-    src/engine/memory_manager.cpp
+    src/backends/ncnn/attention_vulkan.cpp
+    src/backends/ncnn/expertbackend_vulkan.cpp
+    src/backends/ncnn/experttransfer_vulkan.cpp
+    src/backends/ncnn/gateddeltanet_vulkan.cpp
+    src/backends/ncnn/hyperconnection_vulkan.cpp
+    src/backends/ncnn/rmsnorm_vulkan.cpp
+    src/backends/ncnn/router_vulkan.cpp
+    src/backends/ncnn/layerhead_vulkan.cpp
+    src/backends/ncnn/latentlayer_vulkan.cpp
+    src/backends/ncnn/moecombine_vulkan.cpp
+    src/backends/ncnn/latentattention_vulkan.cpp
+    src/backends/ncnn/linear.cpp
+    src/backends/ncnn/modelpipeline.cpp
+    src/backends/ncnn/vulkancontext.cpp
+    src/engine/cpu.cpp
+    src/engine/executor.cpp
+    src/engine/executor_speculative.cpp
+    src/engine/expert.cpp
+    src/engine/expertbackend.cpp
+    src/engine/metrics.cpp
+    src/engine/modelloader.cpp
     src/engine/runtime.cpp
     src/engine/scheduler.cpp
     src/engine/session.cpp
-    src/graph/execution_graph.cpp
-    src/graph/expert_dispatcher.cpp
-    src/graph/memory_planner.cpp
-    src/graph/model_compiler.cpp
-    src/kernels/cpu_attention.cpp
-    src/kernels/cpu_bfloat16.cpp
-    src/kernels/cpu_float8.cpp
-    src/kernels/cpu_gated_delta_net.cpp
-    src/kernels/cpu_gated_residual.cpp
-    src/kernels/cpu_hyper_connection.cpp
-    src/kernels/cpu_latent_attention.cpp
-    src/kernels/cpu_mxfp4.cpp
-    src/kernels/cpu_qnk.cpp
-    src/kernels/cpu_ops.cpp
-    src/kernels/cpu_ple.cpp
-    src/kernels/cpu_state_cache.cpp
-    src/kernels/cpu_vector.cpp
-    src/models/builtin_model_adapter.cpp
-    src/models/deepseek_v4_model_adapter.cpp
-    src/models/qwen3_5_moe_model_adapter.cpp
-    src/models/qwen4_exp_model_adapter.cpp
+    src/graph/compiler.cpp
+    src/graph/graph.cpp
+    src/graph/memoryplan.cpp
+    src/graph/router.cpp
+    src/kernels/attention.cpp
+    src/kernels/bfloat16.cpp
+    src/kernels/float8.cpp
+    src/kernels/gateddeltanet.cpp
+    src/kernels/gatedresidual.cpp
+    src/kernels/hyperconnection.cpp
+    src/kernels/latentattention.cpp
+    src/kernels/mxfp4.cpp
+    src/kernels/ops.cpp
+    src/kernels/ple.cpp
+    src/kernels/qnk.cpp
+    src/kernels/statecache.cpp
+    src/kernels/vector.cpp
+    src/models/modeladapter.cpp
+    src/models/modeladapter_gptoss.cpp
+    src/models/modeladapter_deepseekv4.cpp
+    src/models/modeladapter_qwen3_5.cpp
+    src/models/modeladapter_qwen4exp.cpp
     src/models/safetensors.cpp
-    src/storage/expert_cache.cpp
-    src/storage/expert_store.cpp
-    src/storage/expert_victim_cache.cpp
-    src/storage/mapped_file.cpp
-    src/storage/system_memory.cpp
-    src/storage/weight_store.cpp
+    src/models/tokenizer.cpp
+    src/storage/expertcache.cpp
+    src/storage/expertresidency.cpp
+    src/storage/expertcache_victim.cpp
+    src/storage/mappedfile.cpp
+    src/storage/weightstore.cpp
 )
 add_library(ncnn_moe STATIC ${NCNN_MOE_SOURCES})
 source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${NCNN_MOE_SOURCES})
 
+if(MSVC)
+    # Tokenizer literals, templates, and parity fixtures must retain UTF-8 bytes.
+    set_property(SOURCE src/models/tokenizer.cpp tests/test_tokenizer.cpp APPEND PROPERTY COMPILE_OPTIONS /utf-8)
+endif()
+install(FILES src/models/unicode.LICENSE
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/ncnn-moe-runtime/licenses)
+
+if(APPLE)
+    target_link_libraries(ncnn_moe PRIVATE "-framework Accelerate")
+endif()
+
 if(MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
     set(NCNN_MOE_MSVC_SIMD_SOURCES
-        src/kernels/cpu_float8_msvc_avx2.cpp
-        src/kernels/cpu_float8_msvc_avx512.cpp
-        src/kernels/cpu_mxfp4_msvc_avx2.cpp
-        src/kernels/cpu_mxfp4_msvc_avx512.cpp
-        src/kernels/cpu_qnk_msvc_avx2.cpp
-        src/kernels/cpu_qnk_msvc_avx512.cpp
-        src/kernels/cpu_vector_msvc_avx2.cpp
-        src/kernels/cpu_vector_msvc_avx512.cpp
+        src/kernels/float8_msvc_avx2.cpp
+        src/kernels/float8_msvc_avx512.cpp
+        src/kernels/mxfp4_msvc_avx2.cpp
+        src/kernels/mxfp4_msvc_avx512.cpp
+        src/kernels/qnk_msvc_avx2.cpp
+        src/kernels/qnk_msvc_avx512.cpp
+        src/kernels/vector_x86_avx2.cpp
+        src/kernels/vector_x86_avx512.cpp
     )
     target_sources(ncnn_moe PRIVATE ${NCNN_MOE_MSVC_SIMD_SOURCES})
     source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${NCNN_MOE_MSVC_SIMD_SOURCES})
     set_source_files_properties(
-        src/kernels/cpu_float8_msvc_avx2.cpp
-        src/kernels/cpu_mxfp4_msvc_avx2.cpp
-        src/kernels/cpu_qnk_msvc_avx2.cpp
-        src/kernels/cpu_vector_msvc_avx2.cpp
+        src/kernels/float8_msvc_avx2.cpp
+        src/kernels/mxfp4_msvc_avx2.cpp
+        src/kernels/qnk_msvc_avx2.cpp
+        src/kernels/vector_x86_avx2.cpp
         PROPERTIES COMPILE_OPTIONS "/arch:AVX2"
     )
     set_source_files_properties(
-        src/kernels/cpu_float8_msvc_avx512.cpp
-        src/kernels/cpu_mxfp4_msvc_avx512.cpp
-        src/kernels/cpu_qnk_msvc_avx512.cpp
-        src/kernels/cpu_vector_msvc_avx512.cpp
+        src/kernels/float8_msvc_avx512.cpp
+        src/kernels/mxfp4_msvc_avx512.cpp
+        src/kernels/qnk_msvc_avx512.cpp
+        src/kernels/vector_x86_avx512.cpp
         PROPERTIES COMPILE_OPTIONS "/arch:AVX512"
     )
-    target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_MSVC_X86_SIMD=1)
+    target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_MSVC_X86_SIMD=1 NCNN_MOE_X86_SIMD=1)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set(NCNN_MOE_TARGET_HAS_X86 OFF)
+    if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+        foreach(NCNN_MOE_ARCH IN LISTS CMAKE_OSX_ARCHITECTURES)
+            if(NCNN_MOE_ARCH MATCHES "^(x86_64|AMD64|amd64|X86|x86|x64|i[3-6]86)$")
+                set(NCNN_MOE_TARGET_HAS_X86 ON)
+            endif()
+        endforeach()
+    elseif(
+        CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|X86|x86|x64|i[3-6]86)$"
+        OR CMAKE_CXX_COMPILER_ARCHITECTURE_ID MATCHES "^(x86_64|AMD64|amd64|X86|x86|x64|i[3-6]86)$"
+    )
+        set(NCNN_MOE_TARGET_HAS_X86 ON)
+    endif()
+
+    if(NCNN_MOE_TARGET_HAS_X86)
+        set(NCNN_MOE_X86_SIMD_SOURCES
+            src/kernels/vector_x86_avx2.cpp
+            src/kernels/vector_x86_avx512.cpp
+        )
+        target_sources(ncnn_moe PRIVATE ${NCNN_MOE_X86_SIMD_SOURCES})
+        source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}/src" FILES ${NCNN_MOE_X86_SIMD_SOURCES})
+        target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_X86_SIMD=1)
+    endif()
 endif()
 
 if(
@@ -127,10 +173,10 @@ if(
     if(NCNN_MOE_COMPILER_SUPPORTS_SVE2)
         target_sources(
             ncnn_moe
-            PRIVATE src/kernels/cpu_mxfp4_sve2.cpp
+            PRIVATE src/kernels/mxfp4_sve2.cpp
         )
         set_source_files_properties(
-            src/kernels/cpu_mxfp4_sve2.cpp
+            src/kernels/mxfp4_sve2.cpp
             PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+sve2"
         )
         target_compile_definitions(
@@ -169,7 +215,7 @@ if(APPLE)
         "Path to libMoltenVK.dylib used by ncnn_moe on macOS")
 endif()
 if(NCNN_MOE_USE_NCNN)
-    if(APPLE AND NCNN_MOE_USE_VULKAN AND NCNN_MOE_ENABLE_EXPERIMENTAL_MACOS_VULKAN)
+    if(APPLE AND NCNN_MOE_USE_VULKAN)
         message(STATUS
             "macOS Vulkan support uses MoltenVK. Build the bundled ncnn submodule "
             "with a local MoltenVK installation.")
@@ -219,8 +265,34 @@ if(NCNN_MOE_USE_NCNN)
     set(NCNN_BUILD_TOOLS OFF CACHE BOOL "Build ncnn tools")
     set(NCNN_VULKAN ${NCNN_MOE_USE_VULKAN} CACHE BOOL "Build ncnn with Vulkan support" FORCE)
     set(NCNN_BF16 ON CACHE BOOL "Build ncnn with bfloat16 support")
-    add_subdirectory(third_party/ncnn EXCLUDE_FROM_ALL)
+
+    # Fix the bundled Runtime conversion and backend layer closure.
+    set(NCNN_MOE_REQUIRED_LAYERS
+        bias binaryop cast crop dequantize flatten gemm innerproduct interp packing padding
+        permute quantize rmsnorm requantize reshape rotaryembed sdpa scale slice softmax)
+    if(NCNN_MOE_USE_VULKAN)
+        list(APPEND NCNN_MOE_REQUIRED_LAYERS layernorm)
+    endif()
+    file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ncnn/src/CMakeLists.txt"
+        NCNN_MOE_LAYER_DECLARATIONS REGEX [=[^ncnn_add_layer\(]=])
+    foreach(NCNN_MOE_LAYER_DECLARATION IN LISTS NCNN_MOE_LAYER_DECLARATIONS)
+        string(REGEX MATCH [=[^ncnn_add_layer\(([A-Za-z0-9_]+)]=]
+            NCNN_MOE_LAYER_MATCH "${NCNN_MOE_LAYER_DECLARATION}")
+        string(TOLOWER "${CMAKE_MATCH_1}" NCNN_MOE_LAYER_NAME)
+        if(NCNN_MOE_LAYER_NAME IN_LIST NCNN_MOE_REQUIRED_LAYERS)
+            set(WITH_LAYER_${NCNN_MOE_LAYER_NAME} ON CACHE BOOL
+                "build with layer ${NCNN_MOE_LAYER_NAME}" FORCE)
+        else()
+            set(WITH_LAYER_${NCNN_MOE_LAYER_NAME} OFF CACHE BOOL
+                "build with layer ${NCNN_MOE_LAYER_NAME}" FORCE)
+        endif()
+    endforeach()
+    add_subdirectory(third_party/ncnn)
     if(TARGET ncnn)
+        if(NCNN_OPENMP AND NOT NCNN_SIMPLEOMP AND TARGET OpenMP::OpenMP_CXX
+            AND NOT OpenMP_CXX_FOUND AND NOT OPENMP_FOUND)
+            target_link_libraries(ncnn PUBLIC OpenMP::OpenMP_CXX)
+        endif()
         target_link_libraries(ncnn_moe PUBLIC ncnn)
         target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_USE_NCNN=1)
         set(NCNN_MOE_WITH_NCNN ON)
@@ -230,8 +302,7 @@ if(NCNN_MOE_USE_NCNN)
                 "NCNN_VULKAN=OFF. Reconfigure with -DNCNN_MOE_USE_VULKAN=ON."
             )
         endif()
-        if(NCNN_MOE_USE_VULKAN AND NCNN_VULKAN
-            AND (NOT APPLE OR NCNN_MOE_ENABLE_EXPERIMENTAL_MACOS_VULKAN))
+        if(NCNN_MOE_USE_VULKAN AND NCNN_VULKAN)
             target_compile_definitions(ncnn_moe PRIVATE NCNN_MOE_WITH_VULKAN=1)
             set(NCNN_MOE_WITH_VULKAN ON)
             if(APPLE)
@@ -239,12 +310,6 @@ if(NCNN_MOE_USE_NCNN)
                     NCNN_MOE_MOLTENVK_LIBRARY_PATH="${NCNN_MOE_MOLTENVK_LIBRARY}"
                 )
             endif()
-        endif()
-        if(APPLE AND NCNN_MOE_USE_VULKAN AND NCNN_VULKAN
-            AND NOT NCNN_MOE_ENABLE_EXPERIMENTAL_MACOS_VULKAN)
-            message(STATUS
-                "The MoltenVK hybrid backend is disabled by configuration on macOS; "
-                "set NCNN_MOE_ENABLE_EXPERIMENTAL_MACOS_VULKAN=ON to enable it.")
         endif()
     endif()
 endif()
@@ -266,7 +331,27 @@ if(NCNN_MOE_WITH_VULKAN)
         src/kernels/vulkan/float8_rms_norm_quantize.comp
         src/kernels/vulkan/float8_swiglu_quantize.comp
         src/kernels/vulkan/gated_delta_net.comp
+        src/kernels/vulkan/activation_rms_norm.comp
+        src/kernels/vulkan/hyper_connection_project.comp
+        src/kernels/vulkan/hyper_connection_mix.comp
+        src/kernels/vulkan/hyper_connection_reduce.comp
+        src/kernels/vulkan/hyper_connection_post.comp
+        src/kernels/vulkan/router_select.comp
+        src/kernels/vulkan/latent_attention_transform.comp
+        src/kernels/vulkan/latent_attention_compress.comp
+        src/kernels/vulkan/latent_attention_index_score.comp
+        src/kernels/vulkan/latent_attention_index_topk.comp
+        src/kernels/vulkan/latent_attention_index_sort.comp
+        src/kernels/vulkan/latent_attention_index_merge.comp
+        src/kernels/vulkan/latent_attention_cache_append.comp
+        src/kernels/vulkan/latent_attention_core.comp
+        src/kernels/vulkan/latent_attention_score.comp
+        src/kernels/vulkan/latent_attention_scored_core.comp
+        src/kernels/vulkan/latent_attention_query.comp
+        src/kernels/vulkan/expert_gather.comp
+        src/kernels/vulkan/moe_combine.comp
         src/kernels/vulkan/mxfp4_gate_up.comp
+        src/kernels/vulkan/mxfp4_row_tile.comp
         src/kernels/vulkan/mxfp4_indexed.comp
         src/kernels/vulkan/mxfp4_projection.comp
         src/kernels/vulkan/mxfp4_route_aggregation.comp
@@ -323,21 +408,117 @@ endif()
 
 if(NCNN_MOE_BUILD_TESTS)
     enable_testing()
+    # This policy test does not link or initialize ncnn/Vulkan. Failure sequences
+    # exercise the same completion and queue drain policies as the GPU helper.
+    add_executable(ncnn_moe_vulkan_wait_policy_test tests/test_vulkan_wait_policy.cpp)
+    target_compile_features(ncnn_moe_vulkan_wait_policy_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_vulkan_wait_policy_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME ncnn_moe_vulkan_wait_policy COMMAND ncnn_moe_vulkan_wait_policy_test)
+
     add_executable(ncnn_moe_tests
-        tests/fixture_model_adapter.cpp
+        tests/modeladapter_fixture.cpp
+        tests/test_batch_combine.cpp
+        tests/test_scratch.cpp
         tests/test_runtime.cpp
     )
     target_link_libraries(ncnn_moe_tests PRIVATE ncnn::moe)
     target_compile_features(ncnn_moe_tests PRIVATE cxx_std_20)
     target_include_directories(ncnn_moe_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_compile_definitions(ncnn_moe_tests PRIVATE NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>)
+    target_compile_definitions(ncnn_moe_tests PRIVATE
+        NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
+        NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
+    )
     add_test(NAME ncnn_moe_tests COMMAND ncnn_moe_tests)
-    if(NCNN_MOE_WITH_VULKAN)
-        add_test(
-            NAME ncnn_moe_pipeline_bind_elision_disabled
-            COMMAND ncnn_moe_tests --disable-vulkan-pipeline-bind-elision
+
+    add_executable(ncnn_moe_latent_vulkan_test tests/test_latent_vulkan.cpp)
+    target_link_libraries(ncnn_moe_latent_vulkan_test PRIVATE ncnn::moe)
+    target_compile_features(ncnn_moe_latent_vulkan_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_latent_vulkan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(ncnn_moe_latent_vulkan_test PRIVATE
+        NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
+        NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
+    )
+    add_test(NAME ncnn_moe_latent_vulkan_test COMMAND ncnn_moe_latent_vulkan_test)
+    set_tests_properties(ncnn_moe_latent_vulkan_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    foreach(NCNN_MOE_VULKAN_TEST IN ITEMS hyperconnection router latent_layer shared_expert moe_combine latent_index)
+        add_executable(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test tests/test_${NCNN_MOE_VULKAN_TEST}_vulkan.cpp)
+        target_link_libraries(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PRIVATE ncnn::moe)
+        target_compile_features(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PRIVATE cxx_std_20)
+        target_include_directories(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
+        target_compile_definitions(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PRIVATE
+            NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
+            NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
         )
-    endif()
+        add_test(NAME ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test COMMAND ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test)
+        set_tests_properties(ncnn_moe_${NCNN_MOE_VULKAN_TEST}_vulkan_test PROPERTIES SKIP_RETURN_CODE 77)
+    endforeach()
+
+    add_executable(ncnn_moe_mxfp4_row_tile_test tests/test_mxfp4_row_tile.cpp)
+    target_link_libraries(ncnn_moe_mxfp4_row_tile_test PRIVATE ncnn::moe)
+    target_compile_features(ncnn_moe_mxfp4_row_tile_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_mxfp4_row_tile_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(ncnn_moe_mxfp4_row_tile_test PRIVATE
+        NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
+        NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
+    )
+    add_test(NAME ncnn_moe_mxfp4_row_tile_test COMMAND ncnn_moe_mxfp4_row_tile_test)
+    set_tests_properties(ncnn_moe_mxfp4_row_tile_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(ncnn_moe_expert_upload_vulkan_test tests/test_expert_upload_vulkan.cpp)
+    target_link_libraries(ncnn_moe_expert_upload_vulkan_test PRIVATE ncnn::moe)
+    target_compile_features(ncnn_moe_expert_upload_vulkan_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_expert_upload_vulkan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(ncnn_moe_expert_upload_vulkan_test PRIVATE
+        NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
+        NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
+    )
+    add_test(NAME ncnn_moe_expert_upload_vulkan_test COMMAND ncnn_moe_expert_upload_vulkan_test)
+    set_tests_properties(ncnn_moe_expert_upload_vulkan_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(ncnn_moe_expert_device_input_test tests/test_expert_device_input.cpp)
+    target_link_libraries(ncnn_moe_expert_device_input_test PRIVATE ncnn::moe)
+    target_compile_features(ncnn_moe_expert_device_input_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_expert_device_input_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(ncnn_moe_expert_device_input_test PRIVATE
+        NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
+        NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
+    )
+    add_test(NAME ncnn_moe_expert_device_input_test COMMAND ncnn_moe_expert_device_input_test)
+    set_tests_properties(ncnn_moe_expert_device_input_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(ncnn_moe_gpu_first_experts_test tests/test_gpu_first_experts.cpp)
+    target_link_libraries(ncnn_moe_gpu_first_experts_test PRIVATE ncnn::moe)
+    target_compile_features(ncnn_moe_gpu_first_experts_test PRIVATE cxx_std_20)
+    target_include_directories(ncnn_moe_gpu_first_experts_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(ncnn_moe_gpu_first_experts_test PRIVATE
+        NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
+        NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
+    )
+    add_test(NAME ncnn_moe_gpu_first_experts_test COMMAND ncnn_moe_gpu_first_experts_test)
+    set_tests_properties(ncnn_moe_gpu_first_experts_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
+    # This consumer must not inherit the runtime's private src include path.
+    add_executable(ncnn_moe_public_api_test tests/public_api/main.cpp)
+    target_link_libraries(ncnn_moe_public_api_test PRIVATE ncnn::moe)
+    add_test(NAME ncnn_moe_public_api_test COMMAND ncnn_moe_public_api_test)
+    set_tests_properties(ncnn_moe_public_api_test PROPERTIES TIMEOUT 60)
+
+    add_executable(ncnn_moe_expert_pipeline_test tests/test_expert_pipeline.cpp)
+    target_link_libraries(ncnn_moe_expert_pipeline_test PRIVATE ncnn::moe)
+    target_include_directories(ncnn_moe_expert_pipeline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(ncnn_moe_expert_pipeline_test PRIVATE
+        NCNN_MOE_WITH_NCNN=$<BOOL:${NCNN_MOE_WITH_NCNN}>
+        NCNN_MOE_WITH_VULKAN=$<BOOL:${NCNN_MOE_WITH_VULKAN}>
+    )
+    add_test(NAME ncnn_moe_expert_pipeline COMMAND ncnn_moe_expert_pipeline_test)
+
+    # Asset-driven tokenizer parity checks use tools/test_tokenizer.py.
+    add_executable(ncnn_moe_tokenizer_test tests/test_tokenizer.cpp)
+    target_link_libraries(ncnn_moe_tokenizer_test PRIVATE ncnn::moe)
+    target_include_directories(ncnn_moe_tokenizer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
     add_test(
         NAME ncnn_moe_style
         COMMAND ${CMAKE_COMMAND}
@@ -351,13 +532,16 @@ if(NCNN_MOE_BUILD_EXAMPLES)
         add_library(
             ncnn_moe_reference_runner
             STATIC
-            examples/internal/run_model.cpp)
+            examples/internal/modelrunner.cpp)
         target_link_libraries(
             ncnn_moe_reference_runner
             PUBLIC ncnn::moe)
         target_compile_features(
             ncnn_moe_reference_runner
             PRIVATE cxx_std_20)
+        target_include_directories(
+            ncnn_moe_reference_runner
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
         add_executable(
             ncnn_moe_gpt_oss
@@ -403,13 +587,17 @@ if(NCNN_MOE_BUILD_EXAMPLES)
     add_executable(
         ncnn_moe_worker
         examples/ncnn_moe_worker.cpp
-        examples/internal/gpu_telemetry.cpp)
+        examples/internal/gputelemetry.cpp)
     target_link_libraries(
         ncnn_moe_worker
         PRIVATE ncnn::moe)
     target_compile_features(
         ncnn_moe_worker
         PRIVATE cxx_std_20)
+    target_include_directories(
+        ncnn_moe_worker
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
     if(WIN32)
         target_link_libraries(ncnn_moe_worker PRIVATE psapi)
     endif()
@@ -504,7 +692,18 @@ install(TARGETS ncnn_moe
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
-install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES
+    include/ncnn/moe/modeladapter.h
+    include/ncnn/moe/modeldescriptor.h
+    include/ncnn/moe/model.h
+    include/ncnn/moe/option.h
+    include/ncnn/moe/result.h
+    include/ncnn/moe/runtime.h
+    include/ncnn/moe/scheduler.h
+    include/ncnn/moe/session.h
+    include/ncnn/moe/types.h
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ncnn/moe
+)
 install(EXPORT ncnn_moeTargets
     NAMESPACE ncnn::
     DESTINATION "${NCNN_MOE_INSTALL_CMAKEDIR}"

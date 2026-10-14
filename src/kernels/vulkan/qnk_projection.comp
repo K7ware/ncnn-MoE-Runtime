@@ -73,7 +73,7 @@ void qnk_scale_min_k4(uint block, int index, out uint scale, out uint minimum)
     else
     {
         scale = (qnk_byte(scales + uint(index + 4)) & 15u)
-                 | ((qnk_byte(scales + uint(index - 4)) >> 6u) << 4u);
+                | ((qnk_byte(scales + uint(index - 4)) >> 6u) << 4u);
         minimum = (qnk_byte(scales + uint(index + 4)) >> 4u)
                   | ((qnk_byte(scales + uint(index)) >> 6u) << 4u);
     }
@@ -91,10 +91,10 @@ int qnk_q3_scale(uint block, uint index)
     const uint transformed2 = ((first >> 4u) & mask2) | (((temporary >> 4u) & mask1) << 4u);
     const uint transformed3 = ((second >> 4u) & mask2) | (((temporary >> 6u) & mask1) << 4u);
     const uint group = index >> 2u;
-    const uint word = group == 0u ? transformed0
-                            : group == 1u ? transformed1
-                            : group == 2u ? transformed2
-                                          : transformed3;
+    const uint word = group == 0u   ? transformed0
+                      : group == 1u ? transformed1
+                      : group == 2u ? transformed2
+                                    : transformed3;
     return qnk_signed_byte((word >> ((index & 3u) * 8u)) & 255u);
 }
 
@@ -160,7 +160,7 @@ float qnk_value(uint block, uint type, uint index)
         const uint low = (group < 2u) ? qnk_byte(low_index) & 15u : qnk_byte(low_index) >> 4u;
         const uint value = low | (((qnk_byte(high_index) >> (group * 2u)) & 3u) << 4u);
         const int signed_value = int(value) - 32;
-        const int scale = qnk_signed_byte(qnk_byte(block + 192u + super * 8u + group * 2u));
+        const int scale = qnk_signed_byte(qnk_byte(block + 192u + super * 8u + group * 2u + (lane >> 4u)));
         return qnk_f16(block + 208u) * float(scale * signed_value);
     }
 

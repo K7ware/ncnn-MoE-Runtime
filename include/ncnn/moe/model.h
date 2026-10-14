@@ -1,83 +1,45 @@
 #ifndef NCNN_MOE_MODEL_H
 #define NCNN_MOE_MODEL_H
 
-#include "ncnn/moe/execution_plan.h"
+#include "ncnn/moe/modeldescriptor.h"
+#include "ncnn/moe/result.h"
+#include "ncnn/moe/types.h"
 
 #include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace ncnn {
 namespace moe {
 
-class SessionBatchAccess;
+struct CompiledModel;
 
 class Model
 {
-private:
-    explicit Model(std::shared_ptr<const CompiledModel> compiled)
-        : compiled_(std::move(compiled))
-    {
-    }
+public:
+    [[nodiscard]] const MoeModelDescriptor& descriptor() const noexcept;
+    [[nodiscard]] HybridMode hybrid_mode() const noexcept;
+    [[nodiscard]] uint32_t vulkan_device_index() const noexcept;
+    [[nodiscard]] const std::vector<uint32_t>& vulkan_device_indices() const noexcept;
 
-    std::shared_ptr<const CompiledModel> compiled_;
+    // Format a UTF-8 JSON array of text messages with the model's chat template.
+    // Invalid UTF-8 is rejected; callers handle console or locale conversion.
+    // Tokenizer assets are loaded once with the model. An empty stop list
+    // means native text handling is unavailable; token-ID execution still works.
+    [[nodiscard]] Result<std::vector<int32_t>> encode(std::string_view messages, bool enable_thinking = true) const;
+    // Each text stream owns its pending UTF-8 bytes. Pass -1 and final=true
+    // to flush an incomplete final character without appending another token.
+    [[nodiscard]] Result<std::string> decode(int32_t token_id, std::string& pending, bool final = false) const;
+    [[nodiscard]] const std::vector<int32_t>& stop_tokens() const noexcept;
+
+private:
+    explicit Model(std::shared_ptr<const CompiledModel> _compiled);
+
+    std::shared_ptr<const CompiledModel> compiled;
 
     friend class Runtime;
-    friend class Session;
-    friend class SessionBatchAccess;
-
-public:
-    [[nodiscard]] const MoeIR& ir() const noexcept
-    {
-        return compiled_->descriptor;
-    }
-    [[nodiscard]] const MoeModelDescriptor& descriptor() const noexcept
-    {
-        return compiled_->descriptor;
-    }
-    [[nodiscard]] HybridMode hybrid_mode() const noexcept
-    {
-        return compiled_->hybrid_mode;
-    }
-    [[nodiscard]] uint32_t vulkan_device_index() const noexcept
-    {
-        return compiled_->vulkan_device_index;
-    }
-    [[nodiscard]] const std::vector<uint32_t>& vulkan_device_indices() const noexcept
-    {
-        return compiled_->vulkan_device_indices;
-    }
-    [[nodiscard]] const std::vector<CompiledLayerPlan>& execution_plan() const noexcept
-    {
-        return compiled_->graph.layer_plans;
-    }
-    [[nodiscard]] const ExecutionGraph& execution_graph() const noexcept
-    {
-        return compiled_->graph;
-    }
-    [[nodiscard]] const ExecutionSchedule& execution_schedule() const noexcept
-    {
-        return compiled_->schedule;
-    }
-    [[nodiscard]] const ExecutionGraph& speculative_execution_graph() const noexcept
-    {
-        return compiled_->speculative.graph;
-    }
-    [[nodiscard]] const ExecutionSchedule& speculative_execution_schedule() const noexcept
-    {
-        return compiled_->speculative.schedule;
-    }
-    [[nodiscard]] const ModelMemoryPlan& memory_plan() const noexcept
-    {
-        return compiled_->memory_plan;
-    }
-    [[nodiscard]] const EffectiveRuntimeConfig& effective_runtime_config() const noexcept
-    {
-        return compiled_->effective_runtime_config;
-    }
-
-    [[nodiscard]] const ExpertStore& expert_store() const noexcept
-    {
-        return *compiled_->expert_store;
-    }
+    friend const CompiledModel& model_compiled(const Model& model) noexcept;
 };
 
 using ModelPtr = std::shared_ptr<Model>;

@@ -1,4 +1,9 @@
-"""Benchmark one tokenizer-backed prompt through the native worker.
+"""Benchmark one prompt through the native worker.
+
+String prompts use the model's native messages interface; native JSON output
+leaves ``prompt_tokens`` null and includes ``prompt_token_count``. Direct token
+IDs remain available for model-specific prompt measurements. Reported ``done``
+metrics retain their runtime timing definitions.
 
 This intentionally reports native ``done`` metrics instead of inferring GPU
 execution from device memory occupancy.  It is useful for before/after
@@ -19,13 +24,14 @@ TOOLS_DIR = Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
-from ncnn_moe_protocol import WorkerClient  # noqa: E402
+from ncnn_moe import load_adapter  # noqa: E402
+from ncnn_moe_protocol import WorkerClient, WorkerError  # noqa: E402
 
 
 DEFAULT_PROMPT = "你好，你能做些什么"
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--worker", required=True, type=Path)
@@ -86,7 +92,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--enable-speculative", action="store_true")
     parser.add_argument("--json", action="store_true", dest="json_output")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def _runtime_args(arguments: argparse.Namespace) -> list[str]:
@@ -160,7 +166,6 @@ def _summary(done_events: list[dict[str, Any]], generated: list[list[int]]) -> d
         "generated_token_ids_by_run": generated,
         "expert_gpu_executions": int(expert.get("gpu_executions", 0)),
         "expert_gpu_execution_failures": int(expert.get("gpu_execution_failures", 0)),
-        "expert_gpu_cpu_preferred": int(expert.get("gpu_cpu_preferred", 0)),
         "expert_gpu_route_aggregation_batches": int(expert.get("gpu_route_aggregation_batches", 0)),
         "expert_gpu_route_aggregation_routes": int(expert.get("gpu_route_aggregation_routes", 0)),
         "expert_gpu_route_aggregation_bytes_saved": int(expert.get("gpu_route_aggregation_bytes_saved", 0)),
@@ -168,8 +173,6 @@ def _summary(done_events: list[dict[str, Any]], generated: list[list[int]]) -> d
         "expert_gpu_cache_misses": int(expert.get("gpu_cache_miss", 0)),
         "expert_gpu_cache_pending_bytes": int(expert.get("gpu_cache_pending_bytes", 0)),
         "expert_gpu_cache_resident_bytes": int(expert.get("gpu_cache_resident_bytes", 0)),
-        "expert_cpu_seconds": float(metrics.get("cpu", {}).get("expert_compute_time_microseconds") or 0) / 1_000_000.0,
-        "gpu_wait_seconds": float(gpu.get("wait_time_microseconds") or 0) / 1_000_000.0,
         "gpu_available": bool(gpu.get("available", False)),
         "gpu_linear_dispatches": int(gpu.get("linear_dispatches", 0)),
         "gpu_attention_blocks": int(gpu.get("attention_blocks", 0)),
@@ -203,16 +206,10 @@ def main() -> int:
         raise SystemExit("GPU Expert cache options require --backend hybrid")
     model = arguments.model.resolve()
     worker = arguments.worker.resolve()
-    adapter = None
-    if arguments.prompt_token_ids is not None:
-        prompt_tokens = list(arguments.prompt_token_ids)
-        stop_tokens: list[int] = []
-    else:
-        from ncnn_moe_adapters import create_adapter
-
-        adapter = create_adapter(model)
-        prompt_tokens = adapter.encode_messages([{"role": "user", "content": arguments.prompt}])
-        stop_tokens = adapter.stop_tokens
+    direct_token_ids = arguments.prompt_token_ids is not None
+    prompt_tokens = list(arguments.prompt_token_ids) if direct_token_ids else None
+    messages = None if direct_token_ids else [{"role": "user", "content": arguments.prompt}]
+    prompt_token_count = len(prompt_tokens) if prompt_tokens is not None else None
     done_events: list[dict[str, Any]] = []
     generated: list[list[int]] = []
 
@@ -222,20 +219,44 @@ def main() -> int:
             prefill_chunk_size=arguments.prefill_chunk_size,
             enable_speculative_context=arguments.enable_speculative,
         )
+        adapter = load_adapter(arguments, model, client.ready) if messages is not None else None
+        stop_tokens = [] if prompt_tokens is not None else None
         for run_index in range(arguments.warmup + arguments.runs):
             if run_index:
                 client.reset("prompt-benchmark")
-            done, token_ids = client.generate(
-                "prompt-benchmark",
-                prompt_tokens,
-                request_id=f"prompt-benchmark-{run_index}",
-                max_new_tokens=arguments.max_new_tokens,
-                temperature=0.0,
-                stop_tokens=stop_tokens,
-                enable_speculative=arguments.enable_speculative,
-                metrics_enabled=False,
-                metrics_interval_ms=0,
-            )
+            options = {
+                "request_id": f"prompt-benchmark-{run_index}",
+                "max_new_tokens": arguments.max_new_tokens,
+                "temperature": 0.0,
+                "enable_speculative": arguments.enable_speculative,
+                "metrics_enabled": False,
+                "metrics_interval_ms": 0,
+            }
+            if messages is not None:
+                assert adapter is not None
+                done, token_ids = client.generate(
+                    "prompt-benchmark",
+                    messages=messages,
+                    enable_thinking=adapter.thinking,
+                    **options,
+                )
+            else:
+                assert prompt_tokens is not None
+                done, token_ids = client.generate(
+                    "prompt-benchmark",
+                    prompt_tokens,
+                    stop_tokens=stop_tokens,
+                    **options,
+                )
+            if messages is not None:
+                metrics = done.get("metrics")
+                count = metrics.get("input_tokens") if isinstance(metrics, dict) else None
+                if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+                    raise WorkerError("worker did not return a valid native prompt token count", done)
+                if prompt_token_count is None:
+                    prompt_token_count = count
+                elif prompt_token_count != count:
+                    raise WorkerError("worker returned inconsistent native prompt token counts", done)
             if run_index >= arguments.warmup:
                 done_events.append(done)
                 generated.append(token_ids)
@@ -246,6 +267,7 @@ def main() -> int:
         "prompt": arguments.prompt if arguments.prompt_token_ids is None else None,
         "adapter": getattr(adapter, "name", None),
         "prompt_tokens": prompt_tokens,
+        "prompt_token_count": prompt_token_count,
         "model": str(model),
         "worker": str(worker),
         "backend": arguments.backend,
@@ -259,7 +281,7 @@ def main() -> int:
             print("prompt token ids:", *result["prompt_tokens"])
         else:
             print(f"prompt: {result['prompt']}")
-        print(f"backend: {result['backend']}, prompt tokens: {len(prompt_tokens)}, generated: {result['generated_tokens']}")
+        print(f"backend: {result['backend']}, prompt tokens: {result['prompt_token_count']}, generated: {result['generated_tokens']}")
         print(f"prompt Token/s: {result['prompt_tokens_per_second']}")
         print(f"median Prompt Token/s: {_format_metric(result['median_prompt_tokens_per_second'])}")
         print(f"generation Token/s: {result['generation_tokens_per_second']}")
@@ -271,7 +293,7 @@ def main() -> int:
         )
         print(
             "GPU evidence: executions={expert_gpu_executions}, failures={expert_gpu_execution_failures}, "
-            "CPU-preferred={expert_gpu_cpu_preferred}, dense dispatches={gpu_linear_dispatches}, "
+            "dense dispatches={gpu_linear_dispatches}, "
             "attention blocks={gpu_attention_blocks}, GDN fusions/submissions={gpu_gated_delta_fusions}/{gpu_gated_delta_submissions}, "
             "uploads/downloads={gpu_batch_uploads}/{gpu_batch_downloads}; {gpu_execution_evidence}".format(**result)
         )
@@ -280,8 +302,8 @@ def main() -> int:
             "routes={expert_gpu_route_aggregation_routes}, bytes-saved={expert_gpu_route_aggregation_bytes_saved}".format(**result)
         )
         print(
-            "Expert: CPU={expert_cpu_seconds:.3f} s, GPU cache hit/miss={expert_gpu_cache_hits}/{expert_gpu_cache_misses}, "
-            "pending={expert_gpu_cache_pending_bytes} bytes, GPU wait={gpu_wait_seconds:.3f} s".format(**result)
+            f"GPU cache hit/miss={result['expert_gpu_cache_hits']}/{result['expert_gpu_cache_misses']}, "
+            f"pending={result['expert_gpu_cache_pending_bytes']} bytes"
         )
         print("generated token ids:", *result["generated_token_ids"])
         if not result["generated_sequences_match"]:

@@ -1,6 +1,6 @@
 #include "safetensors.h"
-#include "kernels/cpu_qnk.h"
-#include "storage/mapped_file.h"
+#include "kernels/qnk.h"
+#include "storage/mappedfile.h"
 
 #include <algorithm>
 #include <array>
@@ -16,9 +16,9 @@
 namespace ncnn {
 namespace moe {
 
-static Result<std::vector<uint8_t>> read_range(const std::filesystem::path& path, uint64_t offset, uint64_t byte_count)
+static Result<std::vector<uint8_t>> read_range(const std::filesystem::path& path, uint64_t offset, uint64_t size)
 {
-    if (offset > static_cast<uint64_t>(std::numeric_limits<std::streamoff>::max()) || byte_count > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+    if (offset > static_cast<uint64_t>(std::numeric_limits<std::streamoff>::max()) || size > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
         return Error{ErrorCode::InvalidModel, "safetensors range is too large: " + path.string()};
 
     std::ifstream stream(path, std::ios::binary);
@@ -28,10 +28,10 @@ static Result<std::vector<uint8_t>> read_range(const std::filesystem::path& path
     if (!stream)
         return Error{ErrorCode::IoError, "cannot seek safetensors shard: " + path.string()};
 
-    std::vector<uint8_t> bytes(static_cast<size_t>(byte_count));
-    if (byte_count > 0 && !stream.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(byte_count)))
+    std::vector<uint8_t> data(static_cast<size_t>(size));
+    if (size > 0 && !stream.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(size)))
         return Error{ErrorCode::InvalidModel, "safetensors shard is truncated: " + path.string()};
-    return bytes;
+    return data;
 }
 
 static std::string packed_tensor_name(const std::string& name)
@@ -131,12 +131,11 @@ static Result<std::vector<uint32_t>> parse_shape(const std::string& text)
     return shape;
 }
 
-static Result<void> parse_header(
-    const std::filesystem::path& path,
-    const std::string& json,
-    uint64_t data_start,
-    uint64_t file_bytes,
-    std::unordered_map<std::string, SafetensorInfo>& tensors)
+static Result<void> parse_header(const std::filesystem::path& path,
+                                 const std::string& json,
+                                 uint64_t data_start,
+                                 uint64_t file_size,
+                                 std::unordered_map<std::string, SafetensorInfo>& tensors)
 {
     const std::regex dtype_expression("\"dtype\"\\s*:\\s*\"([^\"]+)\"");
     const std::regex shape_expression("\"shape\"\\s*:\\s*\\[([^\\]]*)\\]");
@@ -186,7 +185,7 @@ static Result<void> parse_header(
         }
         if (end < begin
             || data_start > std::numeric_limits<uint64_t>::max() - end
-            || data_start + end > file_bytes)
+            || data_start + end > file_size)
             return Error{ErrorCode::InvalidModel, "invalid safetensors data range: " + name};
         if (tensors.contains(name))
             return Error{ErrorCode::InvalidModel, "duplicate safetensors tensor: " + name};
@@ -195,12 +194,11 @@ static Result<void> parse_header(
     return {};
 }
 
-static Result<void> open_safetensors_file(
-    const std::filesystem::path& path,
-    std::unordered_map<std::string, SafetensorInfo>& tensors)
+static Result<void> open_safetensors_file(const std::filesystem::path& path,
+                                          std::unordered_map<std::string, SafetensorInfo>& tensors)
 {
     std::error_code size_error;
-    const uint64_t file_bytes = std::filesystem::file_size(path, size_error);
+    const uint64_t file_size = std::filesystem::file_size(path, size_error);
     if (size_error)
         return Error{ErrorCode::IoError, "cannot inspect safetensors shard: " + path.string()};
 
@@ -211,18 +209,17 @@ static Result<void> open_safetensors_file(
     stream.read(reinterpret_cast<char*>(&header_length), sizeof(header_length));
     if (!stream || header_length == 0 || header_length > 128 * 1024 * 1024)
         return Error{ErrorCode::InvalidModel, "invalid safetensors header length: " + path.string()};
-    if (header_length > file_bytes - std::min<uint64_t>(file_bytes, sizeof(header_length)))
+    if (header_length > file_size - std::min<uint64_t>(file_size, sizeof(header_length)))
         return Error{ErrorCode::InvalidModel, "truncated safetensors header: " + path.string()};
     std::string header(static_cast<size_t>(header_length), '\0');
     stream.read(header.data(), static_cast<std::streamsize>(header_length));
     if (!stream)
         return Error{ErrorCode::InvalidModel, "truncated safetensors header: " + path.string()};
-    return parse_header(
-        path,
-        header,
-        sizeof(header_length) + header_length,
-        file_bytes,
-        tensors);
+    return parse_header(path,
+                        header,
+                        sizeof(header_length) + header_length,
+                        file_size,
+                        tensors);
 }
 
 Result<SafetensorsArchive> SafetensorsArchive::open(const std::filesystem::path& root)
@@ -236,11 +233,11 @@ Result<SafetensorsArchive> SafetensorsArchive::open(const std::filesystem::path&
         if (!entry.is_regular_file() || entry.path().extension() != ".safetensors")
             continue;
 
-        auto status = open_safetensors_file(entry.path(), archive.tensors_);
+        auto status = open_safetensors_file(entry.path(), archive.tensors);
         if (!status)
             return status.error();
     }
-    if (archive.tensors_.empty())
+    if (archive.tensors.empty())
         return Error{ErrorCode::InvalidModel, "model directory contains no safetensors tensors"};
     return archive;
 }
@@ -248,25 +245,24 @@ Result<SafetensorsArchive> SafetensorsArchive::open(const std::filesystem::path&
 Result<SafetensorsArchive> SafetensorsArchive::open_file(const std::filesystem::path& path)
 {
     SafetensorsArchive archive;
-    auto status = open_safetensors_file(path, archive.tensors_);
+    auto status = open_safetensors_file(path, archive.tensors);
     if (!status)
         return status.error();
-    if (archive.tensors_.empty())
+    if (archive.tensors.empty())
         return Error{ErrorCode::InvalidModel, "safetensors file contains no tensors: " + path.string()};
     return archive;
 }
 
 const SafetensorInfo* SafetensorsArchive::find(const std::string& name) const noexcept
 {
-    const auto iterator = tensors_.find(name);
-    return iterator == tensors_.end() ? nullptr : &iterator->second;
+    const auto iterator = tensors.find(name);
+    return iterator == tensors.end() ? nullptr : &iterator->second;
 }
 
-std::optional<DType> SafetensorsArchive::find_qnk_expert_dtype(
-    const std::string& name,
-    uint32_t expert_count,
-    uint32_t rows,
-    uint32_t columns) const noexcept
+std::optional<DType> SafetensorsArchive::find_qnk_expert_dtype(const std::string& name,
+                                                               uint32_t expert_count,
+                                                               uint32_t rows,
+                                                               uint32_t columns) const noexcept
 {
     if (expert_count == 0 || !qnk_shape_supported(DType::Q2K, rows, columns))
         return {};
@@ -282,16 +278,16 @@ std::optional<DType> SafetensorsArchive::find_qnk_expert_dtype(
     };
     for (const DType dtype : dtypes)
     {
-        const uint64_t expert_bytes = qnk_storage_bytes(dtype, rows, columns);
-        if (expert_bytes == 0
-            || expert_bytes > std::numeric_limits<uint64_t>::max() / expert_count)
+        const uint64_t expert_size = qnk_storage_bytes(dtype, rows, columns);
+        if (expert_size == 0
+            || expert_size > std::numeric_limits<uint64_t>::max() / expert_count)
         {
             continue;
         }
-        const uint64_t bank_bytes = expert_bytes * expert_count;
+        const uint64_t bank_size = expert_size * expert_count;
         if (source
             && source->dtype == "U8"
-            && source->byte_count == bank_bytes)
+            && source->size == bank_size)
         {
             return dtype;
         }
@@ -309,57 +305,57 @@ Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name) cons
     tensor.shape = info->shape;
     if (info->dtype == "BF16")
     {
-        if (info->byte_count % sizeof(uint16_t) != 0)
+        if (info->size % sizeof(uint16_t) != 0)
             return Error{ErrorCode::InvalidModel, "invalid BF16 byte count: " + name};
         tensor.dtype = DType::BFloat16;
-        auto mapped = MappedFileRange::open(info->path, info->offset, info->byte_count);
+        auto mapped = MappedFileRange::open(info->path, info->offset, info->size);
         if (mapped && reinterpret_cast<uintptr_t>(mapped.value()->data()) % alignof(uint16_t) == 0)
         {
             tensor.mapped_data = mapped.value()->share_data();
-            tensor.mapped_byte_count = info->byte_count;
+            tensor.mapped_size = info->size;
             return tensor;
         }
-        auto bytes = read_range(info->path, info->offset, info->byte_count);
-        if (!bytes)
-            return bytes.error();
-        tensor.bfloat16_data.resize(static_cast<size_t>(info->byte_count / sizeof(uint16_t)));
-        std::memcpy(tensor.bfloat16_data.data(), bytes.value().data(), static_cast<size_t>(info->byte_count));
+        auto data = read_range(info->path, info->offset, info->size);
+        if (!data)
+            return data.error();
+        tensor.bfloat16_data.resize(static_cast<size_t>(info->size / sizeof(uint16_t)));
+        std::memcpy(tensor.bfloat16_data.data(), data.value().data(), static_cast<size_t>(info->size));
     }
     else if (info->dtype == "F32")
     {
-        if (info->byte_count % sizeof(float) != 0)
+        if (info->size % sizeof(float) != 0)
             return Error{ErrorCode::InvalidModel, "invalid F32 byte count: " + name};
         tensor.dtype = DType::Float32;
-        auto mapped = MappedFileRange::open(info->path, info->offset, info->byte_count);
+        auto mapped = MappedFileRange::open(info->path, info->offset, info->size);
         if (mapped && reinterpret_cast<uintptr_t>(mapped.value()->data()) % alignof(float) == 0)
         {
             tensor.mapped_data = mapped.value()->share_data();
-            tensor.mapped_byte_count = info->byte_count;
+            tensor.mapped_size = info->size;
             return tensor;
         }
-        auto bytes = read_range(info->path, info->offset, info->byte_count);
-        if (!bytes)
-            return bytes.error();
-        tensor.float32_data.resize(static_cast<size_t>(info->byte_count / sizeof(float)));
-        std::memcpy(tensor.float32_data.data(), bytes.value().data(), static_cast<size_t>(info->byte_count));
+        auto data = read_range(info->path, info->offset, info->size);
+        if (!data)
+            return data.error();
+        tensor.float32_data.resize(static_cast<size_t>(info->size / sizeof(float)));
+        std::memcpy(tensor.float32_data.data(), data.value().data(), static_cast<size_t>(info->size));
     }
     else if (info->dtype == "I64")
     {
-        if (info->byte_count % sizeof(int64_t) != 0)
+        if (info->size % sizeof(int64_t) != 0)
             return Error{ErrorCode::InvalidModel, "invalid I64 byte count: " + name};
         tensor.dtype = DType::Int64;
-        auto mapped = MappedFileRange::open(info->path, info->offset, info->byte_count);
+        auto mapped = MappedFileRange::open(info->path, info->offset, info->size);
         if (mapped && reinterpret_cast<uintptr_t>(mapped.value()->data()) % alignof(int64_t) == 0)
         {
             tensor.mapped_data = mapped.value()->share_data();
-            tensor.mapped_byte_count = info->byte_count;
+            tensor.mapped_size = info->size;
             return tensor;
         }
-        auto bytes = read_range(info->path, info->offset, info->byte_count);
-        if (!bytes)
-            return bytes.error();
-        tensor.int64_data.resize(static_cast<size_t>(info->byte_count / sizeof(int64_t)));
-        std::memcpy(tensor.int64_data.data(), bytes.value().data(), static_cast<size_t>(info->byte_count));
+        auto data = read_range(info->path, info->offset, info->size);
+        if (!data)
+            return data.error();
+        tensor.int64_data.resize(static_cast<size_t>(info->size / sizeof(int64_t)));
+        std::memcpy(tensor.int64_data.data(), data.value().data(), static_cast<size_t>(info->size));
     }
     else
     {
@@ -368,72 +364,70 @@ Result<TensorData> SafetensorsArchive::load_tensor(const std::string& name) cons
     return tensor;
 }
 
-Result<TensorData> SafetensorsArchive::load_qnk_tensor(
-    const std::string& name,
-    DType dtype,
-    uint32_t rows,
-    uint32_t columns) const
+Result<TensorData> SafetensorsArchive::load_qnk_tensor(const std::string& name,
+                                                       DType dtype,
+                                                       uint32_t rows,
+                                                       uint32_t columns) const
 {
     if (!qnk_shape_supported(dtype, rows, columns))
         return Error{ErrorCode::InvalidArgument, "invalid Qn_K tensor shape: " + name};
-    const uint64_t expected_bytes = qnk_storage_bytes(dtype, rows, columns);
+    const uint64_t expected_size = qnk_storage_bytes(dtype, rows, columns);
     const SafetensorInfo* source = find(name);
-    if (!source || source->dtype != "U8" || source->byte_count != expected_bytes)
+    if (!source || source->dtype != "U8" || source->size != expected_size)
         return Error{ErrorCode::InvalidModel, "invalid Qn_K safetensors tensor: " + name};
 
     TensorData tensor;
     tensor.dtype = dtype;
     tensor.shape = {rows, columns};
-    auto mapped = MappedFileRange::open(source->path, source->offset, source->byte_count);
+    auto mapped = MappedFileRange::open(source->path, source->offset, source->size);
     if (mapped)
     {
         mapped.value()->prefault();
         tensor.mapped_data = mapped.value()->share_data();
-        tensor.mapped_byte_count = source->byte_count;
+        tensor.mapped_size = source->size;
         return tensor;
     }
-    auto bytes = read_range(source->path, source->offset, source->byte_count);
-    if (!bytes)
-        return bytes.error();
-    tensor.quantized_data = std::move(bytes).value();
+    auto data = read_range(source->path, source->offset, source->size);
+    if (!data)
+        return data.error();
+    tensor.quantized_data = std::move(data).value();
     return tensor;
 }
 
-Result<TensorData> SafetensorsArchive::load_qnk_expert(
-    const std::string& name,
-    DType dtype,
-    uint32_t expert_id,
-    uint32_t expert_count,
-    uint32_t rows,
-    uint32_t columns) const
+Result<TensorData> SafetensorsArchive::load_qnk_expert(const std::string& name,
+                                                       DType dtype,
+                                                       uint32_t expert_id,
+                                                       uint32_t expert_count,
+                                                       uint32_t rows,
+                                                       uint32_t columns) const
 {
     if (expert_count == 0 || expert_id >= expert_count || !qnk_shape_supported(dtype, rows, columns))
         return Error{ErrorCode::InvalidArgument, "invalid Qn_K Expert shape: " + name};
-    const uint64_t expert_bytes = qnk_storage_bytes(dtype, rows, columns);
+    const uint64_t expert_size = qnk_storage_bytes(dtype, rows, columns);
     const SafetensorInfo* source = find(name);
     if (!source || source->dtype != "U8"
-        || expert_bytes > std::numeric_limits<uint64_t>::max() / expert_count
-        || source->byte_count != expert_bytes * expert_count)
+        || expert_size > std::numeric_limits<uint64_t>::max() / expert_count
+        || source->size != expert_size * expert_count)
     {
         return Error{ErrorCode::InvalidModel, "invalid Qn_K Expert tensor: " + name};
     }
-    const uint64_t offset = source->offset + expert_id * expert_bytes;
+    const uint64_t offset = source->offset + expert_id * expert_size;
 
     TensorData tensor;
     tensor.dtype = dtype;
     tensor.shape = {rows, columns};
-    auto mapped = MappedFileRange::open(source->path, offset, expert_bytes);
+    auto mapped = MappedFileRange::open(source->path, offset, expert_size);
     if (mapped)
     {
         mapped.value()->prefault();
         tensor.mapped_data = mapped.value()->share_data();
-        tensor.mapped_byte_count = expert_bytes;
+        tensor.mapped_size = expert_size;
         return tensor;
     }
-    auto bytes = read_range(source->path, offset, expert_bytes);
-    if (!bytes)
-        return bytes.error();
-    tensor.quantized_data = std::move(bytes).value();
+    auto data = read_range(source->path, offset, expert_size);
+    if (!data)
+        return data.error();
+    tensor.quantized_data = std::move(data).value();
     return tensor;
 }
 
@@ -446,8 +440,8 @@ Result<TensorData> SafetensorsArchive::load_float8_tensor(const std::string& wei
     const uint32_t output_blocks = (weight->shape[0] + 127) / 128;
     const uint32_t input_blocks = (weight->shape[1] + 127) / 128;
     if (scale->shape != std::vector<uint32_t>{output_blocks, input_blocks}
-        || weight->byte_count != static_cast<uint64_t>(weight->shape[0]) * weight->shape[1]
-        || scale->byte_count != static_cast<uint64_t>(output_blocks) * input_blocks)
+        || weight->size != static_cast<uint64_t>(weight->shape[0]) * weight->shape[1]
+        || scale->size != static_cast<uint64_t>(output_blocks) * input_blocks)
     {
         return Error{ErrorCode::InvalidModel, "invalid blockwise FP8 tensor shape: " + weight_name};
     }
@@ -455,23 +449,23 @@ Result<TensorData> SafetensorsArchive::load_float8_tensor(const std::string& wei
     TensorData tensor;
     tensor.dtype = DType::Float8E4M3;
     tensor.shape = weight->shape;
-    auto mapped = MappedFileRange::open(weight->path, weight->offset, weight->byte_count);
+    auto mapped = MappedFileRange::open(weight->path, weight->offset, weight->size);
     if (mapped)
     {
         tensor.mapped_data = mapped.value()->share_data();
-        tensor.mapped_byte_count = weight->byte_count;
+        tensor.mapped_size = weight->size;
     }
     else
     {
         return Error{ErrorCode::IoError, "cannot map blockwise FP8 tensor: " + weight_name};
     }
 
-    auto scale_bytes = read_range(scale->path, scale->offset, scale->byte_count);
-    if (!scale_bytes)
-        return scale_bytes.error();
-    tensor.quantization_scales.resize(scale_bytes.value().size());
-    for (size_t index = 0; index < scale_bytes.value().size(); ++index)
-        tensor.quantization_scales[index] = std::ldexp(1.0f, static_cast<int>(scale_bytes.value()[index]) - 127);
+    auto scale_data = read_range(scale->path, scale->offset, scale->size);
+    if (!scale_data)
+        return scale_data.error();
+    tensor.quantization_scales.resize(scale_data.value().size());
+    for (size_t index = 0; index < scale_data.value().size(); ++index)
+        tensor.quantization_scales[index] = std::ldexp(1.0f, static_cast<int>(scale_data.value()[index]) - 127);
     return tensor;
 }
 
@@ -491,7 +485,9 @@ Result<TensorData> SafetensorsArchive::load_mxfp4_tensor(const std::string& bloc
         scales = packed_scales;
     }
     if (!blocks || !scales || blocks->dtype != "I8" || scales->dtype != "F8_E8M0"
-        || columns % 32 != 0
+        || rows == 0 || columns == 0 || columns % 32 != 0
+        || blocks->size != static_cast<uint64_t>(rows) * columns / 2
+        || scales->size != static_cast<uint64_t>(rows) * columns / 32
         || blocks->shape != std::vector<uint32_t>{rows, columns / 2}
         || scales->shape != std::vector<uint32_t>{rows, columns / 32})
     {
@@ -506,16 +502,16 @@ Result<TensorData> SafetensorsArchive::load_mxfp4_tensor(const std::string& bloc
         auto storage = std::make_shared<MxFp4FileStorage>();
         storage->blocks_path = blocks->path.string();
         storage->blocks_offset = blocks->offset;
-        storage->blocks_bytes = blocks->byte_count;
+        storage->blocks_size = blocks->size;
         storage->scales_path = scales->path.string();
         storage->scales_offset = scales->offset;
-        storage->scales_bytes = scales->byte_count;
+        storage->scales_size = scales->size;
         tensor.mxfp4_file_storage = std::move(storage);
         return tensor;
     }
 
-    auto block_mapping = MappedFileRange::open(blocks->path, blocks->offset, blocks->byte_count);
-    auto scale_mapping = MappedFileRange::open(scales->path, scales->offset, scales->byte_count);
+    auto block_mapping = MappedFileRange::open(blocks->path, blocks->offset, blocks->size);
+    auto scale_mapping = MappedFileRange::open(scales->path, scales->offset, scales->size);
     if (block_mapping && scale_mapping)
     {
         block_mapping.value()->prefault();
@@ -524,8 +520,8 @@ Result<TensorData> SafetensorsArchive::load_mxfp4_tensor(const std::string& bloc
         tensor.mxfp4_scales = scale_mapping.value()->share_bytes();
         return tensor;
     }
-    auto block_data = read_range(blocks->path, blocks->offset, blocks->byte_count);
-    auto scale_data = read_range(scales->path, scales->offset, scales->byte_count);
+    auto block_data = read_range(blocks->path, blocks->offset, blocks->size);
+    auto scale_data = read_range(scales->path, scales->offset, scales->size);
     if (!block_data)
         return block_data.error();
     if (!scale_data)
@@ -539,6 +535,13 @@ Result<TensorData> SafetensorsArchive::load_interleaved_mxfp4_tensor(const std::
                                                                      const std::string& up_blocks_name, const std::string& up_scales_name,
                                                                      uint32_t rows, uint32_t columns, uint32_t flags) const
 {
+    if (rows == 0 || columns == 0 || rows > std::numeric_limits<uint32_t>::max() / 2
+        || columns % 32 != 0)
+    {
+        return Error{ErrorCode::InvalidModel, "invalid interleaved MXFP4 tensor: " + gate_blocks_name};
+    }
+    const uint64_t block_size = static_cast<uint64_t>(rows) * columns / 2;
+    const uint64_t scale_size = static_cast<uint64_t>(rows) * columns / 32;
     if (has_flag(flags, SafetensorLoadDeferMxfp4Data))
     {
         const SafetensorInfo* gate_blocks = find(gate_blocks_name);
@@ -567,6 +570,8 @@ Result<TensorData> SafetensorsArchive::load_interleaved_mxfp4_tensor(const std::
         if (!gate_blocks || !gate_scales || !up_blocks || !up_scales
             || gate_blocks->dtype != "I8" || up_blocks->dtype != "I8"
             || gate_scales->dtype != "F8_E8M0" || up_scales->dtype != "F8_E8M0"
+            || gate_blocks->size != block_size || up_blocks->size != block_size
+            || gate_scales->size != scale_size || up_scales->size != scale_size
             || gate_blocks->shape != std::vector<uint32_t>{rows, columns / 2}
             || up_blocks->shape != gate_blocks->shape
             || gate_scales->shape != std::vector<uint32_t>{rows, columns / 32}
@@ -580,20 +585,23 @@ Result<TensorData> SafetensorsArchive::load_interleaved_mxfp4_tensor(const std::
         auto storage = std::make_shared<MxFp4FileStorage>();
         storage->blocks_path = gate_blocks->path.string();
         storage->blocks_offset = gate_blocks->offset;
-        storage->blocks_bytes = gate_blocks->byte_count;
+        storage->blocks_size = gate_blocks->size;
         storage->scales_path = gate_scales->path.string();
         storage->scales_offset = gate_scales->offset;
-        storage->scales_bytes = gate_scales->byte_count;
+        storage->scales_size = gate_scales->size;
         storage->secondary_blocks_path = up_blocks->path.string();
         storage->secondary_blocks_offset = up_blocks->offset;
-        storage->secondary_blocks_bytes = up_blocks->byte_count;
+        storage->secondary_blocks_size = up_blocks->size;
         storage->secondary_scales_path = up_scales->path.string();
         storage->secondary_scales_offset = up_scales->offset;
-        storage->secondary_scales_bytes = up_scales->byte_count;
+        storage->secondary_scales_size = up_scales->size;
         storage->interleave_rows = true;
         tensor.mxfp4_file_storage = std::move(storage);
         return tensor;
     }
+
+    if (block_size > std::numeric_limits<size_t>::max() / 2)
+        return Error{ErrorCode::InvalidModel, "invalid interleaved MXFP4 tensor: " + gate_blocks_name};
 
     auto gate = load_mxfp4_tensor(gate_blocks_name, gate_scales_name, rows, columns);
     auto up = load_mxfp4_tensor(up_blocks_name, up_scales_name, rows, columns);
@@ -604,16 +612,16 @@ Result<TensorData> SafetensorsArchive::load_interleaved_mxfp4_tensor(const std::
     TensorData tensor;
     tensor.dtype = DType::MxFp4;
     tensor.shape = {rows * 2, columns};
-    const size_t block_row_bytes = columns / 2;
-    const size_t scale_row_bytes = columns / 32;
-    tensor.mxfp4_blocks.resize(static_cast<size_t>(rows) * block_row_bytes * 2);
-    tensor.mxfp4_scales.resize(static_cast<size_t>(rows) * scale_row_bytes * 2);
+    const size_t block_row_size = columns / 2;
+    const size_t scale_row_size = columns / 32;
+    tensor.mxfp4_blocks.resize(static_cast<size_t>(block_size * 2));
+    tensor.mxfp4_scales.resize(static_cast<size_t>(scale_size * 2));
     for (uint32_t row = 0; row < rows; ++row)
     {
-        std::memcpy(tensor.mxfp4_blocks.data() + static_cast<size_t>(row * 2) * block_row_bytes, gate.value().mxfp4_blocks.data() + static_cast<size_t>(row) * block_row_bytes, block_row_bytes);
-        std::memcpy(tensor.mxfp4_blocks.data() + static_cast<size_t>(row * 2 + 1) * block_row_bytes, up.value().mxfp4_blocks.data() + static_cast<size_t>(row) * block_row_bytes, block_row_bytes);
-        std::memcpy(tensor.mxfp4_scales.data() + static_cast<size_t>(row * 2) * scale_row_bytes, gate.value().mxfp4_scales.data() + static_cast<size_t>(row) * scale_row_bytes, scale_row_bytes);
-        std::memcpy(tensor.mxfp4_scales.data() + static_cast<size_t>(row * 2 + 1) * scale_row_bytes, up.value().mxfp4_scales.data() + static_cast<size_t>(row) * scale_row_bytes, scale_row_bytes);
+        std::memcpy(tensor.mxfp4_blocks.data() + static_cast<size_t>(row * 2) * block_row_size, gate.value().mxfp4_blocks.data() + static_cast<size_t>(row) * block_row_size, block_row_size);
+        std::memcpy(tensor.mxfp4_blocks.data() + static_cast<size_t>(row * 2 + 1) * block_row_size, up.value().mxfp4_blocks.data() + static_cast<size_t>(row) * block_row_size, block_row_size);
+        std::memcpy(tensor.mxfp4_scales.data() + static_cast<size_t>(row * 2) * scale_row_size, gate.value().mxfp4_scales.data() + static_cast<size_t>(row) * scale_row_size, scale_row_size);
+        std::memcpy(tensor.mxfp4_scales.data() + static_cast<size_t>(row * 2 + 1) * scale_row_size, up.value().mxfp4_scales.data() + static_cast<size_t>(row) * scale_row_size, scale_row_size);
     }
     return tensor;
 }
@@ -626,40 +634,40 @@ Result<TensorData> SafetensorsArchive::load_bfloat16_slice(const std::string& na
     uint64_t element_count = 1;
     for (uint32_t dimension : shape)
         element_count *= dimension;
-    const uint64_t byte_count = element_count * sizeof(uint16_t);
-    if (byte_count * info->shape[0] != info->byte_count)
+    const uint64_t slice_size = element_count * sizeof(uint16_t);
+    if (slice_size * info->shape[0] != info->size)
         return Error{ErrorCode::InvalidModel, "BF16 tensor slice shape mismatch: " + name};
 
     TensorData tensor;
     tensor.dtype = DType::BFloat16;
     tensor.shape = std::move(shape);
-    auto mapped = MappedFileRange::open(info->path, info->offset + index * byte_count, byte_count);
+    auto mapped = MappedFileRange::open(info->path, info->offset + index * slice_size, slice_size);
     if (mapped && reinterpret_cast<uintptr_t>(mapped.value()->data()) % alignof(uint16_t) == 0)
     {
         tensor.mapped_data = mapped.value()->share_data();
-        tensor.mapped_byte_count = byte_count;
+        tensor.mapped_size = slice_size;
         return tensor;
     }
-    auto bytes = read_range(info->path, info->offset + index * byte_count, byte_count);
-    if (!bytes)
-        return bytes.error();
+    auto data = read_range(info->path, info->offset + index * slice_size, slice_size);
+    if (!data)
+        return data.error();
     tensor.bfloat16_data.resize(static_cast<size_t>(element_count));
-    std::memcpy(tensor.bfloat16_data.data(), bytes.value().data(), static_cast<size_t>(byte_count));
+    std::memcpy(tensor.bfloat16_data.data(), data.value().data(), static_cast<size_t>(slice_size));
     return tensor;
 }
 
-Result<TensorData> SafetensorsArchive::load_mxfp4_expert(
-    const std::string& blocks_name,
-    const std::string& scales_name,
-    uint32_t expert_id,
-    uint32_t rows,
-    uint32_t columns,
-    uint32_t flags) const
+Result<TensorData> SafetensorsArchive::load_mxfp4_expert(const std::string& blocks_name,
+                                                         const std::string& scales_name,
+                                                         uint32_t expert_id,
+                                                         uint32_t rows,
+                                                         uint32_t columns,
+                                                         uint32_t flags) const
 {
     const SafetensorInfo* blocks = find(blocks_name);
     const SafetensorInfo* scales = find(scales_name);
     if (!blocks || !scales || blocks->dtype != "U8" || scales->dtype != "U8"
-        || columns % 32 != 0 || blocks->shape.size() != 4 || scales->shape.size() != 3)
+        || rows == 0 || columns == 0 || columns % 32 != 0
+        || blocks->shape.size() != 4 || scales->shape.size() != 3)
         return Error{ErrorCode::InvalidModel, "invalid MXFP4 expert tensors: " + blocks_name};
     const std::vector<uint32_t> expected_blocks = {blocks->shape[0], rows, columns / 32, 16};
     const std::vector<uint32_t> expected_scales = {scales->shape[0], rows, columns / 32};
@@ -667,8 +675,9 @@ Result<TensorData> SafetensorsArchive::load_mxfp4_expert(
         || blocks->shape[0] != scales->shape[0] || expert_id >= blocks->shape[0])
         return Error{ErrorCode::InvalidModel, "invalid MXFP4 expert tensors: " + blocks_name};
 
-    const uint64_t block_bytes = static_cast<uint64_t>(rows) * columns / 2;
-    const uint64_t scale_bytes = static_cast<uint64_t>(rows) * columns / 32;
+    const uint64_t block_size = static_cast<uint64_t>(rows) * columns / 2;
+    const uint64_t scale_size = static_cast<uint64_t>(rows) * columns / 32;
+    const uint64_t expert_count = blocks->shape[0];
     const std::string packed_prefix = "__ncnn_moe_packed__." + std::to_string(expert_id) + ".";
     const SafetensorInfo* packed_blocks = find(packed_prefix + blocks_name);
     const SafetensorInfo* packed_scales = find(packed_prefix + scales_name);
@@ -679,17 +688,24 @@ Result<TensorData> SafetensorsArchive::load_mxfp4_expert(
     if (packed_blocks
         && (packed_blocks->dtype != "U8"
             || packed_scales->dtype != "U8"
-            || packed_blocks->byte_count != block_bytes
-            || packed_scales->byte_count != scale_bytes
+            || packed_blocks->size != block_size
+            || packed_scales->size != scale_size
             || packed_blocks->shape != std::vector<uint32_t>{rows, columns / 32, 16}
             || packed_scales->shape != std::vector<uint32_t>{rows, columns / 32}))
     {
         return Error{ErrorCode::InvalidModel, "invalid packed MXFP4 Expert tensors: " + blocks_name};
     }
+    if (!packed_blocks
+        && (block_size > std::numeric_limits<uint64_t>::max() / expert_count
+            || blocks->size != block_size * expert_count
+            || scales->size != scale_size * expert_count))
+    {
+        return Error{ErrorCode::InvalidModel, "invalid MXFP4 Expert tensors: " + blocks_name};
+    }
     const SafetensorInfo* selected_blocks = packed_blocks ? packed_blocks : blocks;
     const SafetensorInfo* selected_scales = packed_scales ? packed_scales : scales;
-    const uint64_t block_offset = selected_blocks->offset + (packed_blocks ? 0 : expert_id * block_bytes);
-    const uint64_t scale_offset = selected_scales->offset + (packed_scales ? 0 : expert_id * scale_bytes);
+    const uint64_t block_offset = selected_blocks->offset + (packed_blocks ? 0 : expert_id * block_size);
+    const uint64_t scale_offset = selected_scales->offset + (packed_scales ? 0 : expert_id * scale_size);
     TensorData tensor;
     tensor.dtype = DType::MxFp4;
     tensor.shape = {rows, columns};
@@ -698,16 +714,16 @@ Result<TensorData> SafetensorsArchive::load_mxfp4_expert(
         auto storage = std::make_shared<MxFp4FileStorage>();
         storage->blocks_path = selected_blocks->path.string();
         storage->blocks_offset = block_offset;
-        storage->blocks_bytes = block_bytes;
+        storage->blocks_size = block_size;
         storage->scales_path = selected_scales->path.string();
         storage->scales_offset = scale_offset;
-        storage->scales_bytes = scale_bytes;
+        storage->scales_size = scale_size;
         tensor.mxfp4_file_storage = std::move(storage);
         return tensor;
     }
 
-    auto block_mapping = MappedFileRange::open(selected_blocks->path, block_offset, block_bytes);
-    auto scale_mapping = MappedFileRange::open(selected_scales->path, scale_offset, scale_bytes);
+    auto block_mapping = MappedFileRange::open(selected_blocks->path, block_offset, block_size);
+    auto scale_mapping = MappedFileRange::open(selected_scales->path, scale_offset, scale_size);
     if (block_mapping && scale_mapping)
     {
         block_mapping.value()->prefault();
@@ -717,10 +733,10 @@ Result<TensorData> SafetensorsArchive::load_mxfp4_expert(
         return tensor;
     }
 
-    auto block_data = read_range(selected_blocks->path, block_offset, block_bytes);
+    auto block_data = read_range(selected_blocks->path, block_offset, block_size);
     if (!block_data)
         return block_data.error();
-    auto scale_data = read_range(selected_scales->path, scale_offset, scale_bytes);
+    auto scale_data = read_range(selected_scales->path, scale_offset, scale_size);
     if (!scale_data)
         return scale_data.error();
     tensor.mxfp4_blocks.assign(block_data.value().data(), block_data.value().size());

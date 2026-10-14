@@ -2,6 +2,8 @@ if(NOT DEFINED NCNN_MOE_SOURCE_DIR)
     message(FATAL_ERROR "NCNN_MOE_SOURCE_DIR is required")
 endif()
 
+get_filename_component(NCNN_MOE_SOURCE_DIR "${NCNN_MOE_SOURCE_DIR}" ABSOLUTE)
+
 file(GLOB_RECURSE NCNN_MOE_STYLE_FILES
     LIST_DIRECTORIES false
     "${NCNN_MOE_SOURCE_DIR}/include/*.h"
@@ -17,12 +19,36 @@ file(GLOB_RECURSE NCNN_MOE_STYLE_FILES
     "${NCNN_MOE_SOURCE_DIR}/examples/*.cpp"
 )
 
+if(NOT NCNN_MOE_STYLE_FILES)
+    message(FATAL_ERROR "No C++ source files found in ${NCNN_MOE_SOURCE_DIR}")
+endif()
+
 set(NCNN_MOE_STYLE_ERRORS "")
 
 foreach(SOURCE_FILE IN LISTS NCNN_MOE_STYLE_FILES)
     file(READ "${SOURCE_FILE}" SOURCE_TEXT)
     string(REPLACE "\r\n" "\n" SOURCE_TEXT "${SOURCE_TEXT}")
     file(RELATIVE_PATH RELATIVE_FILE "${NCNN_MOE_SOURCE_DIR}" "${SOURCE_FILE}")
+
+    # Check direct includes at the public API and layer boundaries.
+    string(REGEX MATCHALL "(^|\n)[ \t]*#[ \t]*include[ \t]*[<\"][^>\"]+[>\"]" INCLUDE_DIRECTIVES "${SOURCE_TEXT}")
+    foreach(INCLUDE_DIRECTIVE IN LISTS INCLUDE_DIRECTIVES)
+        if(RELATIVE_FILE MATCHES "^include/" AND INCLUDE_DIRECTIVE MATCHES "[<\"]((src/)?(engine|graph|kernels|models|storage|backends)/|\\.\\./)")
+            string(APPEND NCNN_MOE_STYLE_ERRORS
+                "${RELATIVE_FILE}: public headers must not include runtime internals\n")
+        elseif(RELATIVE_FILE MATCHES "^src/models/" AND INCLUDE_DIRECTIVE MATCHES "[<\"](src/|\\.\\./)?(engine|graph|backends)/")
+            string(APPEND NCNN_MOE_STYLE_ERRORS
+                "${RELATIVE_FILE}: model adapters must not include execution or backend internals\n")
+        elseif(RELATIVE_FILE MATCHES "^src/backends/"
+               AND INCLUDE_DIRECTIVE MATCHES "[<\"]((\\.\\./)*(src/)?models/|ncnn/moe/modeladapter\\.h)")
+            string(APPEND NCNN_MOE_STYLE_ERRORS
+                "${RELATIVE_FILE}: backend code must not include model adapters\n")
+        elseif(RELATIVE_FILE MATCHES "^src/graph/(graph|layerplan)\\.h$"
+               AND INCLUDE_DIRECTIVE MATCHES "[<\"]((\\.\\./)*(src/)?(backends|engine|kernels|models)/[^>\"]+|((\\.\\./)*(src/)?graph/)?compiledoperator\\.h)[>\"]")
+            string(APPEND NCNN_MOE_STYLE_ERRORS
+                "${RELATIVE_FILE}: graph foundation headers must not include backend or execution implementations\n")
+        endif()
+    endforeach()
 
     if(SOURCE_TEXT MATCHES "namespace[ \t]*\\{")
         string(APPEND NCNN_MOE_STYLE_ERRORS "${RELATIVE_FILE}: anonymous namespace is not allowed\n")
@@ -51,7 +77,9 @@ foreach(SOURCE_FILE IN LISTS NCNN_MOE_STYLE_FILES)
         string(APPEND NCNN_MOE_STYLE_ERRORS
             "${RELATIVE_FILE}: name bitmap positions with NCNN_MOE_*_BIT macros\n")
     endif()
-    if(SOURCE_TEXT MATCHES "\n[ \t]+(=|\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=)[ \t]+")
+    # Newer clang-format may place a pure virtual '= 0;' on its own line.
+    string(REGEX REPLACE "\n[ \t]+= 0;" "" ASSIGNMENT_CHECK_TEXT "${SOURCE_TEXT}")
+    if(ASSIGNMENT_CHECK_TEXT MATCHES "\n[ \t]+(=|\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=)[ \t]+")
         string(APPEND NCNN_MOE_STYLE_ERRORS
             "${RELATIVE_FILE}: keep an assignment operator with its left-hand side\n")
     endif()
@@ -69,4 +97,16 @@ endforeach()
 
 if(NCNN_MOE_STYLE_ERRORS)
     message(FATAL_ERROR "ncnn_moe style violations:\n${NCNN_MOE_STYLE_ERRORS}")
+endif()
+
+# ColumnLimit: 0 preserves existing newlines, so clang-format alone does not
+# reject a first argument placed below the opening parenthesis.
+find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
+execute_process(
+    COMMAND "${Python3_EXECUTABLE}" "${NCNN_MOE_SOURCE_DIR}/cmake/check_format.py"
+        --source-dir "${NCNN_MOE_SOURCE_DIR}"
+    RESULT_VARIABLE NCNN_MOE_FORMAT_RESULT
+)
+if(NOT NCNN_MOE_FORMAT_RESULT EQUAL 0)
+    message(FATAL_ERROR "ncnn_moe argument placement or clang-format check failed")
 endif()

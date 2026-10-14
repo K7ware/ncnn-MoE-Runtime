@@ -1,0 +1,199 @@
+#ifndef NCNN_MOE_OPTION_H
+#define NCNN_MOE_OPTION_H
+
+#include "ncnn/moe/types.h"
+
+#include <cstdint>
+#include <vector>
+
+namespace ncnn {
+namespace moe {
+
+// Model loading option flags are kept in this public header.
+#define NCNN_MOE_OPTION_DISABLE_VICTIM_EXEC_BIT 0
+#define NCNN_MOE_OPTION_ROUTER_PRED_BIT         1
+#define NCNN_MOE_OPTION_FORWARD_ARC_BIT         2
+#define NCNN_MOE_OPTION_RANK_ADAPT_BIT          3
+#define NCNN_MOE_OPTION_READ_MERGE_BIT          4
+#define NCNN_MOE_OPTION_ASYNC_ROUTER_PRED_BIT   5
+#define NCNN_MOE_OPTION_RELEASE_DENSE_BIT       6
+#define NCNN_MOE_OPTION_DISABLE_GPU_EXPERT_BIT  7
+
+enum OptionFlag : uint32_t
+{
+    OptionDisableGpuVictimExecution = UINT32_C(1) << NCNN_MOE_OPTION_DISABLE_VICTIM_EXEC_BIT,
+    OptionRouterPrediction = UINT32_C(1) << NCNN_MOE_OPTION_ROUTER_PRED_BIT,
+    OptionForwardAwareCache = UINT32_C(1) << NCNN_MOE_OPTION_FORWARD_ARC_BIT,
+    OptionRankAdaptivePrefetch = UINT32_C(1) << NCNN_MOE_OPTION_RANK_ADAPT_BIT,
+    OptionCrossExpertReadCoalescing = UINT32_C(1) << NCNN_MOE_OPTION_READ_MERGE_BIT,
+    OptionAsyncRouterPrediction = UINT32_C(1) << NCNN_MOE_OPTION_ASYNC_ROUTER_PRED_BIT,
+    OptionReleaseVulkanDenseHostStorage = UINT32_C(1) << NCNN_MOE_OPTION_RELEASE_DENSE_BIT,
+    OptionDisableGpuExpertExecution = UINT32_C(1) << NCNN_MOE_OPTION_DISABLE_GPU_EXPERT_BIT
+};
+
+// Algorithm and backend choices use a separate bitmap from storage policy.
+// Normalization, GatedDelta and row/group scheduling are automatic. Retired
+// bits 0, 2, 9, 11, 13, 15, 16, 26 and 28-31 stay unused so remaining flag
+// values do not change.
+#define NCNN_MOE_OPT_CPU_FAST_SILU_BIT                 1
+#define NCNN_MOE_OPT_CPU_FLOAT8_FUSED_GATE_UP_BIT      3
+#define NCNN_MOE_OPT_CPU_FLOAT8_BF16_DOT_BIT           4
+#define NCNN_MOE_OPT_CPU_FLOAT8_BATCH_TILE_BIT         5
+#define NCNN_MOE_OPT_CPU_FLOAT8_SIMD_QUANTIZE_BIT      6
+#define NCNN_MOE_OPT_CPU_FLOAT8_FUSED_PROJECTIONS_BIT  7
+#define NCNN_MOE_OPT_CPU_BFLOAT16_BATCHED_BIT          8
+#define NCNN_MOE_OPT_CPU_BF16_DIRECT_ATTENTION_BIT     10
+#define NCNN_MOE_OPT_CPU_LATENT_PREPARED_ROPE_BIT      12
+#define NCNN_MOE_OPT_CPU_LATENT_ONLINE_SOFTMAX_BIT     14
+#define NCNN_MOE_OPT_VULKAN_BFLOAT16_COOP_MATRIX_BIT   17
+#define NCNN_MOE_OPT_VULKAN_ATTENTION_BIT              18
+#define NCNN_MOE_OPT_VULKAN_ATTENTION_BATCH_BIT        19
+#define NCNN_MOE_OPT_VULKAN_KV_PROMOTION_BIT           20
+#define NCNN_MOE_OPT_VULKAN_DEVICE_ROPE_BIT            21
+#define NCNN_MOE_OPT_VULKAN_DECODE_SDPA_BIT            22
+#define NCNN_MOE_OPT_VULKAN_QKV_RING_BIT               23
+#define NCNN_MOE_OPT_VULKAN_ROUTE_AGGREGATION_BIT      24
+#define NCNN_MOE_OPT_VULKAN_EXPERT_BATCH_ADMISSION_BIT 25
+#define NCNN_MOE_OPT_VULKAN_LATENT_COMPRESSOR_BIT      27
+#define NCNN_MOE_OPT_VULKAN_COMMAND_GRAPH_BIT          32
+#define NCNN_MOE_OPT_CPU_LATENT_VECTOR_SOFTMAX_BIT     33
+#define NCNN_MOE_OPT_VULKAN_LATENT_INPUT_RMS_NORM_BIT  34
+#define NCNN_MOE_OPT_VULKAN_EXPERT_GPU_PRIORITY_BIT    35
+#define NCNN_MOE_OPT_CPU_MXFP4_Q8_BIT                  36
+#define NCNN_MOE_OPT_CPU_FLASH_ATTENTION_BIT           37
+#define NCNN_MOE_OPT_CPU_SPLIT_KV_ATTENTION_BIT        38
+#define NCNN_MOE_OPT_VULKAN_INDEXED_EXPERTS_BIT        39
+#define NCNN_MOE_OPT_VULKAN_QNK_BIT                    40
+#define NCNN_MOE_OPT_CPU_PACKED_WEIGHTS_BIT            41
+#define NCNN_MOE_OPT_VULKAN_JOINT_CACHE_EVICTION_BIT   42
+#define NCNN_MOE_OPT_VULKAN_MXFP4_ROW_TILE_BIT         43
+#define NCNN_MOE_OPT_VULKAN_EXPERT_DIRECT_STAGING_BIT  44
+#define NCNN_MOE_OPT_VULKAN_SHARED_EXPERT_OVERLAP_BIT  45
+
+enum OptimizationFlag : uint64_t
+{
+    OptimizationCpuFastSilu = UINT64_C(1) << NCNN_MOE_OPT_CPU_FAST_SILU_BIT,
+    OptimizationCpuFloat8FusedGateUp = UINT64_C(1) << NCNN_MOE_OPT_CPU_FLOAT8_FUSED_GATE_UP_BIT,
+    OptimizationCpuFloat8Bf16Dot = UINT64_C(1) << NCNN_MOE_OPT_CPU_FLOAT8_BF16_DOT_BIT,
+    OptimizationCpuFloat8BatchTile = UINT64_C(1) << NCNN_MOE_OPT_CPU_FLOAT8_BATCH_TILE_BIT,
+    OptimizationCpuFloat8SimdQuantize = UINT64_C(1) << NCNN_MOE_OPT_CPU_FLOAT8_SIMD_QUANTIZE_BIT,
+    OptimizationCpuFloat8FusedProjections = UINT64_C(1) << NCNN_MOE_OPT_CPU_FLOAT8_FUSED_PROJECTIONS_BIT,
+    OptimizationCpuBfloat16Batched = UINT64_C(1) << NCNN_MOE_OPT_CPU_BFLOAT16_BATCHED_BIT,
+    OptimizationCpuBf16DirectAttention = UINT64_C(1) << NCNN_MOE_OPT_CPU_BF16_DIRECT_ATTENTION_BIT,
+    OptimizationCpuLatentPreparedRope = UINT64_C(1) << NCNN_MOE_OPT_CPU_LATENT_PREPARED_ROPE_BIT,
+    OptimizationCpuLatentOnlineSoftmax = UINT64_C(1) << NCNN_MOE_OPT_CPU_LATENT_ONLINE_SOFTMAX_BIT,
+    OptimizationVulkanBfloat16CoopMatrix = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_BFLOAT16_COOP_MATRIX_BIT,
+    OptimizationVulkanAttention = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_ATTENTION_BIT,
+    OptimizationVulkanAttentionBatch = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_ATTENTION_BATCH_BIT,
+    OptimizationVulkanKvPromotion = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_KV_PROMOTION_BIT,
+    OptimizationVulkanDeviceRope = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_DEVICE_ROPE_BIT,
+    OptimizationVulkanDecodeSdpa = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_DECODE_SDPA_BIT,
+    OptimizationVulkanQkvRing = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_QKV_RING_BIT,
+    OptimizationVulkanRouteAggregation = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_ROUTE_AGGREGATION_BIT,
+    OptimizationVulkanExpertBatchAdmission = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_EXPERT_BATCH_ADMISSION_BIT,
+    OptimizationVulkanLatentCompressor = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_LATENT_COMPRESSOR_BIT,
+    OptimizationVulkanCommandGraph = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_COMMAND_GRAPH_BIT,
+    OptimizationCpuLatentVectorSoftmax = UINT64_C(1) << NCNN_MOE_OPT_CPU_LATENT_VECTOR_SOFTMAX_BIT,
+    OptimizationVulkanLatentInputRmsNorm = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_LATENT_INPUT_RMS_NORM_BIT,
+    OptimizationVulkanExpertGpuPriority = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_EXPERT_GPU_PRIORITY_BIT,
+    OptimizationCpuMxfp4Q8 = UINT64_C(1) << NCNN_MOE_OPT_CPU_MXFP4_Q8_BIT,
+    OptimizationCpuFlashAttention = UINT64_C(1) << NCNN_MOE_OPT_CPU_FLASH_ATTENTION_BIT,
+    OptimizationCpuSplitKvAttention = UINT64_C(1) << NCNN_MOE_OPT_CPU_SPLIT_KV_ATTENTION_BIT,
+    OptimizationVulkanIndexedExperts = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_INDEXED_EXPERTS_BIT,
+    OptimizationVulkanQnK = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_QNK_BIT,
+    OptimizationVulkanJointCacheEviction = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_JOINT_CACHE_EVICTION_BIT,
+    OptimizationVulkanMxfp4RowTile = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_MXFP4_ROW_TILE_BIT,
+    OptimizationVulkanExpertDirectStaging = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_EXPERT_DIRECT_STAGING_BIT,
+    OptimizationVulkanSharedExpertOverlap = UINT64_C(1) << NCNN_MOE_OPT_VULKAN_SHARED_EXPERT_OVERLAP_BIT,
+    // Internal execution bit selected from CpuPackedWeightMode. It is not
+    // part of OptimizationDefaultFlags.
+    OptimizationCpuPackedWeights = UINT64_C(1) << NCNN_MOE_OPT_CPU_PACKED_WEIGHTS_BIT
+};
+
+inline constexpr uint64_t OptimizationDefaultFlags = OptimizationCpuFastSilu
+                                                     | OptimizationCpuFloat8FusedGateUp
+                                                     | OptimizationCpuFloat8Bf16Dot
+                                                     | OptimizationCpuFloat8BatchTile
+                                                     | OptimizationCpuFloat8SimdQuantize
+                                                     | OptimizationCpuFloat8FusedProjections
+                                                     | OptimizationCpuBfloat16Batched
+                                                     | OptimizationCpuBf16DirectAttention
+                                                     | OptimizationCpuFlashAttention
+                                                     | OptimizationCpuSplitKvAttention
+                                                     | OptimizationCpuLatentPreparedRope
+                                                     | OptimizationCpuLatentOnlineSoftmax
+                                                     | OptimizationCpuMxfp4Q8
+                                                     | OptimizationVulkanBfloat16CoopMatrix
+                                                     | OptimizationVulkanAttention
+                                                     | OptimizationVulkanAttentionBatch
+                                                     | OptimizationVulkanKvPromotion
+                                                     | OptimizationVulkanDeviceRope
+                                                     | OptimizationVulkanDecodeSdpa
+                                                     | OptimizationVulkanQkvRing
+                                                     | OptimizationVulkanRouteAggregation
+                                                     | OptimizationVulkanExpertBatchAdmission
+                                                     | OptimizationVulkanLatentCompressor
+                                                     | OptimizationVulkanCommandGraph
+                                                     | OptimizationCpuLatentVectorSoftmax
+                                                     | OptimizationVulkanLatentInputRmsNorm
+                                                     | OptimizationVulkanExpertGpuPriority
+                                                     | OptimizationVulkanIndexedExperts
+                                                     | OptimizationVulkanQnK
+                                                     | OptimizationVulkanJointCacheEviction
+                                                     | OptimizationVulkanMxfp4RowTile
+                                                     | OptimizationVulkanExpertDirectStaging
+                                                     | OptimizationVulkanSharedExpertOverlap;
+
+inline constexpr uint64_t OptimizationOptionalFlags = OptimizationCpuPackedWeights;
+inline constexpr uint64_t OptimizationAllFlags = OptimizationDefaultFlags | OptimizationOptionalFlags;
+static_assert((OptimizationDefaultFlags & OptimizationOptionalFlags) == 0);
+
+// User-supplied model loading options. Zero-valued memory settings and Auto
+// enum values leave hardware- and model-specific decisions to Runtime.
+// Tokenizer, prompt, chat, and sampling state deliberately do not belong here.
+enum class ExpertMemoryMode
+{
+    Auto,
+    Eager,
+    OnDemand
+};
+
+enum class CpuPackedWeightMode
+{
+    Disabled,
+    Enabled
+};
+
+enum class ExpertIoMode
+{
+    // Auto keeps the existing adaptive read policy; other values select one
+    // explicit storage/read strategy.
+    Auto,
+    Mmap,
+    Direct,
+    Buffered
+};
+
+struct Option
+{
+    HybridMode hybrid_mode = HybridMode::Auto;
+    ExpertMemoryMode expert_memory_mode = ExpertMemoryMode::Auto;
+    CpuPackedWeightMode cpu_packed_weight_mode = CpuPackedWeightMode::Disabled;
+    ExpertIoMode expert_io_mode = ExpertIoMode::Auto;
+    uint64_t host_memory_budget = 0;
+    uint64_t expert_cache_size = 0;
+    uint64_t expert_gpu_cache_size = 0;
+    uint64_t expert_gpu_victim_cache_size = 0;
+    uint32_t expert_gpu_victim_reuse_probe_interval = 1;
+    uint32_t num_expert_io_threads = 0;
+    uint32_t vulkan_device_index = automatic_vulkan_device_index;
+    uint32_t num_concurrent_sessions = 1;
+    std::vector<uint32_t> vulkan_device_indices;
+    uint32_t flags = 0;
+    uint64_t optimization_flags = OptimizationDefaultFlags;
+};
+
+} // namespace moe
+} // namespace ncnn
+
+#endif // NCNN_MOE_OPTION_H

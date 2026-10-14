@@ -12,13 +12,13 @@ is required.
 | --- | --- |
 | Package | Official multi-shard Hugging Face Safetensors and `config.json` |
 | Dense weights | BF16/F32 with automatic mmap and buffered fallback |
-| Attention | RMSNorm, fused QKV+RoPE, adaptive online Decode SDPA, GQA, learned sinks, full/sliding Attention, and YaRN RoPE |
+| Attention | RMSNorm, fused QKV+RoPE, option-controlled fused Decode SDPA, GQA, learned sinks, full/sliding Attention, and YaRN RoPE |
 | KV cache | Persistent per-Session BF16 or FP32 CPU cache; FP32 mixed-backend ring |
 | Experts | Native MXFP4 blocks and scales with runtime-selected CPU SIMD kernels |
 | Mixed execution | Vulkan Dense/Attention with CPU routing and Experts |
 | Expert residency | Automatic, eager, or byte-bounded on-demand |
 | Expert I/O | Asynchronous range reads, Windows aligned direct I/O, packed sidecar support, and byte-aware ARC |
-| Scheduling | Independent Sessions, Expert coalescing, and bounded cross-call micro-batching |
+| Scheduling | Independent Sessions, explicit batch submission, and Expert coalescing |
 | Generation | Greedy, temperature, Top-K, Top-P, Min-P, stop tokens, and streaming |
 
 GPT-OSS-20B can use eager Expert residency when memory permits. GPT-OSS-120B
@@ -36,17 +36,18 @@ hf download openai/gpt-oss-120b --local-dir .\models\gpt-oss\gpt-oss-120b
 ```
 
 Each directory must contain `config.json`, `model.safetensors.index.json`, and
-every shard referenced by the index. Build the examples by following the root
+every shard referenced by the index. Text prompts also require the official
+`tokenizer.json` and `tokenizer_config.json` assets. Build the examples by following the root
 [Quick start](../../README.md#quick-start), then build `ncnn_moe_worker` for
 normal text and chat usage.
 
 ## Run text or chat
 
-The unified CLI applies the official Harmony formatting and token decoding while
-the native worker remains tokenizer-free:
+Runtime applies Harmony formatting and token decoding from the local tokenizer
+assets. The unified CLI sends messages to the native worker:
 
 ```powershell
-python -m pip install -e ".[gpt-oss]"
+python -m pip install -e .
 python tools\ncnn_moe.py run `
   --model .\models\gpt-oss\gpt-oss-20b `
   --prompt "Reply with exactly: OK" `
@@ -129,8 +130,6 @@ uses a byte-bounded cache backed by exact ranges in the original shards.
 | `--vulkan-device N` | Select one Vulkan device |
 | `--vulkan-devices N[,N...]` | Supply candidates for capability-weighted layer placement |
 | `--parallel-sessions N` | Run independent sequences through the batch scheduler |
-| `--scheduler-expert-threads N` | Override Expert threads per scheduler worker |
-| `--scheduler-cross-call` | Let the Runtime collector form micro-batches across submissions |
 
 Dense tensors and eager MXFP4 ranges are mapped automatically. On-demand
 Experts are read directly into final cache storage without allocating or

@@ -1,0 +1,67 @@
+#ifndef NCNN_MOE_ROUTER_H
+#define NCNN_MOE_ROUTER_H
+
+#include "ncnn/moe/result.h"
+#include "ncnn/moe/types.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <vector>
+
+namespace ncnn {
+namespace moe {
+
+struct ExpertRoute
+{
+    uint32_t token_index = 0;
+    uint32_t rank = 0;
+    float weight = 0.0f;
+};
+
+struct ExpertBatch
+{
+    uint32_t expert_id = 0;
+    std::vector<ExpertRoute> routes;
+};
+
+struct RouteCandidate
+{
+    uint32_t expert_id = 0;
+    float score = 0.0f;
+    uint32_t rank = 0;
+};
+
+struct ExpertDispatchOptions
+{
+    uint32_t expert_count = 0;
+    uint32_t top_k = 0;
+    RouterScoreFunction score_function = RouterScoreFunction::Softmax;
+    RouterNormalization normalization = RouterNormalization::SelectedExperts;
+    float routed_scaling_factor = 1.0f;
+    std::span<const float> selection_bias;
+    std::span<const uint32_t> explicit_expert_ids;
+};
+
+struct ExpertDispatchPlan
+{
+    std::vector<ExpertBatch> batches;
+    // Pending routes indexed by Expert id; retain storage across prefill calls.
+    std::vector<std::vector<ExpertRoute>> route_scratch;
+    std::vector<float> scores;
+    std::vector<RouteCandidate> selected;
+    size_t assignment_count = 0;
+};
+
+// Input rows are token-major. Published batches are ordered by Expert id and
+// keep each expert's routes in input order. Reuses caller storage; routing
+// errors leave the published batches unchanged.
+[[nodiscard]] Result<void> forward_router(std::span<const float> router_logits,
+                                          uint32_t token_count,
+                                          const ExpertDispatchOptions& options,
+                                          ExpertDispatchPlan& result);
+
+} // namespace moe
+} // namespace ncnn
+
+#endif // NCNN_MOE_ROUTER_H

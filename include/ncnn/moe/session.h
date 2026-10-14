@@ -1,7 +1,6 @@
 #ifndef NCNN_MOE_SESSION_H
 #define NCNN_MOE_SESSION_H
 
-#include "ncnn/moe/memory_manager.h"
 #include "ncnn/moe/model.h"
 #include "ncnn/moe/result.h"
 
@@ -22,31 +21,23 @@ namespace moe {
 
 static constexpr uint32_t maximum_expert_route_ranks = 16;
 
-class SessionBatchAccess;
+class BatchSchedulerPrivate;
 
-class CpuSessionState;
-class IExecutor;
-struct SamplingScratch;
-
-struct LogitsOutput
-{
-    std::vector<float> values;
-};
+class SessionState;
 
 struct PrefillResult
 {
-    LogitsOutput logits;
+    std::vector<float> logits;
     uint32_t processed_tokens = 0;
 };
 
 struct DecodeResult
 {
-    LogitsOutput logits;
+    std::vector<float> logits;
     uint64_t sequence_length = 0;
 };
 
-// Model-neutral token-ID distribution controls.  This is intentionally not a
-// tokenizer, chat-template, or conversation policy.
+// Model-neutral token-ID distribution controls.
 struct SamplingOptions
 {
     float temperature = 1.0f;
@@ -66,19 +57,18 @@ struct StreamToken
     uint32_t index = 0;
     int32_t token_id = -1;
     float probability = 0.0f;
-    // Optional decoded text supplied by a caller-owned tokenizer boundary.
+    // Optional decoded text supplied by the generation decoder.
     std::string text;
     bool is_stop_token = false;
 };
 
-// Token-ID generation controls and stop IDs.  High-level chat policy remains
-// outside Runtime.
+// Token-ID generation controls; use Model::stop_tokens() for text generation.
 struct GenerationOptions
 {
     uint32_t max_new_tokens = 1;
     SamplingOptions sampling;
     std::vector<int32_t> stop_tokens;
-    bool enable_speculative = true;
+    bool use_speculative = true;
     float speculative_confidence_threshold = 0.5f;
     uint32_t speculative_max_draft_tokens = 0;
 };
@@ -90,8 +80,7 @@ struct GenerationResult
     bool stopped_by_callback = false;
 };
 
-// Token text decoding stays outside the model runtime and is supplied by the
-// application boundary when a caller wants decoded text in the result.
+// A generation decoder can use Model::decode with stream-local UTF-8 state.
 using TokenTextDecoder = std::function<std::string(int32_t token_id)>;
 using TokenStreamCallback = std::function<bool(const StreamToken& token)>;
 
@@ -103,14 +92,10 @@ struct SessionStatistics
     uint64_t expert_batches = 0;
     uint64_t expert_batch_weight_bytes = 0;
     uint64_t expert_route_weight_bytes = 0;
-    uint64_t expert_prefetches = 0;
-    uint64_t expert_prefetch_bytes = 0;
     uint64_t expert_route_predictions = 0;
     uint64_t expert_route_prediction_matches = 0;
     uint64_t expert_route_prediction_cache_hits = 0;
     uint64_t expert_route_prediction_cache_misses = 0;
-    uint64_t expert_route_prediction_time_microseconds = 0;
-    uint64_t expert_route_prediction_wait_time_microseconds = 0;
     uint64_t expert_route_prediction_async_submissions = 0;
     uint64_t expert_route_prediction_async_completions = 0;
     uint64_t expert_route_prediction_async_fallbacks = 0;
@@ -122,18 +107,18 @@ struct SessionStatistics
     uint64_t expert_cache_misses = 0;
     uint64_t expert_cache_evictions = 0;
     uint64_t expert_cache_bytes_read = 0;
-    uint64_t expert_cache_resident_bytes = 0;
+    uint64_t expert_cache_resident_size = 0;
     uint64_t expert_cache_queued_reads = 0;
     uint64_t expert_cache_speculative_reads = 0;
     uint64_t expert_cache_cancelled_speculative_reads = 0;
     uint64_t expert_cache_dropped_speculative_admissions = 0;
     uint64_t expert_cache_unused_speculative_reads = 0;
     uint64_t expert_cache_short_term_reloads = 0;
-    uint64_t expert_cache_arc_recent_bytes = 0;
-    uint64_t expert_cache_arc_frequent_bytes = 0;
-    uint64_t expert_cache_arc_recent_target_bytes = 0;
-    uint64_t expert_cache_arc_recent_ghost_bytes = 0;
-    uint64_t expert_cache_arc_frequent_ghost_bytes = 0;
+    uint64_t expert_cache_arc_recent_size = 0;
+    uint64_t expert_cache_arc_frequent_size = 0;
+    uint64_t expert_cache_arc_recent_target_size = 0;
+    uint64_t expert_cache_arc_recent_ghost_size = 0;
+    uint64_t expert_cache_arc_frequent_ghost_size = 0;
     uint64_t expert_cache_arc_recent_ghost_hits = 0;
     uint64_t expert_cache_arc_frequent_ghost_hits = 0;
     uint64_t expert_cache_mapped_ranges = 0;
@@ -154,8 +139,8 @@ struct SessionStatistics
     uint64_t expert_gpu_cache_evictions = 0;
     uint64_t expert_gpu_cache_dropped_admissions = 0;
     uint64_t expert_gpu_cache_bytes_uploaded = 0;
-    uint64_t expert_gpu_cache_resident_bytes = 0;
-    uint64_t expert_gpu_cache_pending_bytes = 0;
+    uint64_t expert_gpu_cache_resident_size = 0;
+    uint64_t expert_gpu_cache_pending_size = 0;
     uint64_t expert_gpu_victim_cache_hits = 0;
     uint64_t expert_gpu_victim_cache_misses = 0;
     uint64_t expert_gpu_victim_cache_admissions = 0;
@@ -168,96 +153,45 @@ struct SessionStatistics
     uint64_t expert_gpu_victim_cache_restore_failures = 0;
     uint64_t expert_gpu_victim_cache_bytes_uploaded = 0;
     uint64_t expert_gpu_victim_cache_bytes_downloaded = 0;
-    uint64_t expert_gpu_victim_cache_restore_time_microseconds = 0;
     uint64_t expert_gpu_victim_cache_mapped_stores = 0;
     uint64_t expert_gpu_victim_cache_mapped_restores = 0;
-    uint64_t expert_gpu_victim_cache_resident_bytes = 0;
-    uint64_t expert_gpu_victim_cache_pending_bytes = 0;
+    uint64_t expert_gpu_victim_cache_resident_size = 0;
+    uint64_t expert_gpu_victim_cache_pending_size = 0;
     uint64_t expert_gpu_executions = 0;
     uint64_t expert_gpu_execution_failures = 0;
-    uint64_t expert_gpu_cpu_preferred = 0;
-    uint64_t expert_gpu_execution_time_microseconds = 0;
-    uint64_t expert_gpu_arc_recent_bytes = 0;
-    uint64_t expert_gpu_arc_frequent_bytes = 0;
-    uint64_t expert_gpu_arc_recent_target_bytes = 0;
-    uint64_t expert_gpu_arc_recent_ghost_bytes = 0;
-    uint64_t expert_gpu_arc_frequent_ghost_bytes = 0;
+    uint64_t expert_gpu_arc_recent_size = 0;
+    uint64_t expert_gpu_arc_frequent_size = 0;
+    uint64_t expert_gpu_arc_recent_target_size = 0;
+    uint64_t expert_gpu_arc_recent_ghost_size = 0;
+    uint64_t expert_gpu_arc_frequent_ghost_size = 0;
     uint64_t expert_gpu_device_source_hits = 0;
     uint64_t expert_gpu_device_source_misses = 0;
     uint64_t expert_gpu_device_source_executions = 0;
     uint64_t expert_gpu_device_source_execution_failures = 0;
-    uint64_t expert_parallel_tasks = 0;
-    uint64_t mxfp4_decode_gemv_rows = 0;
-    uint64_t mxfp4_prefill_gemm_rows = 0;
-    uint64_t mxfp4_paired_rows = 0;
-    uint64_t mxfp4_fused_gate_up_rows = 0;
-    uint64_t mxfp4_reused_input_rows = 0;
     uint64_t vulkan_linear_dispatches = 0;
     uint64_t vulkan_attention_blocks = 0;
     uint64_t vulkan_compute_submissions = 0;
-    uint64_t vulkan_submit_wait_time_microseconds = 0;
     uint64_t vulkan_batch_uploads = 0;
     uint64_t vulkan_batch_downloads = 0;
-    uint64_t vulkan_auxiliary_uploads = 0;
-    uint64_t vulkan_auxiliary_upload_bytes = 0;
-    uint64_t vulkan_staging_slot_resizes = 0;
-    uint64_t vulkan_staging_slot_reuses = 0;
-    uint64_t vulkan_staging_slot_acquisitions = 0;
-    uint64_t vulkan_staging_slot_contentions = 0;
     uint64_t vulkan_command_buffer_reuses = 0;
     uint64_t vulkan_command_graph_submissions = 0;
     uint64_t vulkan_command_graph_operations = 0;
-    uint64_t vulkan_direct_host_input_bindings = 0;
-    uint64_t vulkan_direct_host_output_bindings = 0;
     uint64_t vulkan_attention_qkv_rope_fusions = 0;
     uint64_t vulkan_attention_device_rope_fusions = 0;
     uint64_t vulkan_attention_qkv_ring_fusions = 0;
-    uint64_t vulkan_attention_qkv_rope_pipeline_failures = 0;
-    uint64_t vulkan_attention_qkv_rope_shape_failures = 0;
-    uint64_t vulkan_attention_qkv_rope_source_failures = 0;
-    uint64_t vulkan_attention_qkv_rope_norm_failures = 0;
-    uint64_t vulkan_attention_qkv_rope_ring_failures = 0;
-    uint64_t vulkan_attention_qkv_rope_allocation_failures = 0;
-    uint64_t vulkan_attention_precondition_failures = 0;
-    uint64_t vulkan_attention_staging_failures = 0;
-    uint64_t vulkan_attention_norm_failures = 0;
-    uint64_t vulkan_attention_qkv_failures = 0;
-    uint64_t vulkan_attention_cache_failures = 0;
-    uint64_t vulkan_attention_sdpa_failures = 0;
-    uint64_t vulkan_attention_projection_failures = 0;
-    uint64_t vulkan_attention_output_failures = 0;
-    uint64_t vulkan_attention_submit_failures = 0;
     uint64_t vulkan_attention_decode_sdpa_fusions = 0;
     uint64_t vulkan_attention_cache_materializations = 0;
     uint64_t vulkan_attention_cpu_fallbacks = 0;
     uint64_t vulkan_kv_ring_appends = 0;
     uint64_t vulkan_kv_ring_resizes = 0;
     uint64_t vulkan_kv_ring_wrapped_views = 0;
-    uint64_t attention_time_microseconds = 0;
-    uint64_t router_time_microseconds = 0;
-    uint64_t expert_time_microseconds = 0;
-    uint64_t expert_cache_wait_time_microseconds = 0;
-    uint64_t expert_cache_management_time_microseconds = 0;
-    uint64_t expert_engine_time_microseconds = 0;
-    uint64_t expert_compute_time_microseconds = 0;
-    uint64_t expert_regroup_time_microseconds = 0;
-    uint64_t expert_combine_time_microseconds = 0;
-    uint64_t embedding_time_microseconds = 0;
-    uint64_t final_norm_time_microseconds = 0;
-    uint64_t lm_head_time_microseconds = 0;
     uint64_t speculative_proposals = 0;
     uint64_t speculative_draft_tokens = 0;
     uint64_t speculative_accepted_tokens = 0;
-    uint64_t speculative_context_time_microseconds = 0;
-    uint64_t speculative_draft_time_microseconds = 0;
-    uint64_t speculative_verify_time_microseconds = 0;
-    uint64_t kv_cache_logical_bytes = 0;
-    uint64_t kv_cache_allocated_bytes = 0;
+    uint64_t kv_cache_logical_size = 0;
+    uint64_t kv_cache_allocated_size = 0;
     std::vector<uint64_t> expert_token_counts;
-    uint32_t expert_cache_io_worker_count = 0;
-    uint32_t expert_cache_adaptive_io_workers = 0;
-    uint64_t expert_cache_io_read_samples = 0;
-    uint64_t expert_cache_io_read_time_microseconds = 0;
+    uint32_t expert_cache_num_io_threads = 0;
     uint64_t expert_gpu_route_aggregation_batches = 0;
     uint64_t expert_gpu_route_aggregation_routes = 0;
     uint64_t expert_gpu_route_aggregation_bytes_saved = 0;
@@ -265,24 +199,11 @@ struct SessionStatistics
     uint64_t vulkan_gated_delta_fusions = 0;
     uint64_t vulkan_gated_delta_submissions = 0;
     uint64_t vulkan_rms_norm_linear_fusions = 0;
-    uint64_t vulkan_kv_cache_promotions = 0;
-    uint64_t vulkan_kv_cache_promotion_bytes = 0;
     uint64_t vulkan_bfloat16_cooperative_matrix_dispatches = 0;
     uint64_t cpu_bfloat16_batched_linear_dispatches = 0;
-    uint64_t vulkan_command_dispatches = 0;
-    uint64_t vulkan_command_pipeline_binds = 0;
-    uint64_t vulkan_command_redundant_pipeline_binds = 0;
-    uint64_t vulkan_command_descriptor_bindings = 0;
-    uint64_t vulkan_command_push_constant_updates = 0;
-    uint64_t vulkan_command_resource_barrier_calls = 0;
-    uint64_t vulkan_command_buffer_resource_barriers = 0;
-    uint64_t vulkan_command_image_resource_barriers = 0;
 };
 
-// Stable, model-neutral counters intended for applications and examples.
-// SessionStatistics remains available for detailed runtime diagnostics, while
-// this view avoids exposing cache/backend implementation names at the native
-// application boundary.
+// Runtime counter snapshot used for generation and cumulative reporting.
 struct RuntimeMetricCounters
 {
     uint64_t prefill_tokens = 0;
@@ -290,14 +211,7 @@ struct RuntimeMetricCounters
     uint64_t expert_cache_hits = 0;
     uint64_t expert_cache_misses = 0;
     uint64_t expert_io_bytes = 0;
-    uint64_t expert_compute_time_microseconds = 0;
     uint64_t gpu_submit_count = 0;
-    uint64_t gpu_wait_time_microseconds = 0;
-    // Wall time measured by the GPU Expert backend. Vulkan device timestamp
-    // queries are not required by the public API, so this is not a full-GPU
-    // kernel timeline.
-    uint64_t gpu_kernel_time_microseconds = 0;
-    bool gpu_kernel_time_available = false;
     uint64_t vulkan_linear_dispatches = 0;
     uint64_t vulkan_attention_blocks = 0;
     uint64_t vulkan_batch_uploads = 0;
@@ -305,21 +219,6 @@ struct RuntimeMetricCounters
     uint64_t vulkan_attention_qkv_rope_fusions = 0;
     uint64_t vulkan_attention_device_rope_fusions = 0;
     uint64_t vulkan_attention_qkv_ring_fusions = 0;
-    uint64_t vulkan_attention_qkv_rope_pipeline_failures = 0;
-    uint64_t vulkan_attention_qkv_rope_shape_failures = 0;
-    uint64_t vulkan_attention_qkv_rope_source_failures = 0;
-    uint64_t vulkan_attention_qkv_rope_norm_failures = 0;
-    uint64_t vulkan_attention_qkv_rope_ring_failures = 0;
-    uint64_t vulkan_attention_qkv_rope_allocation_failures = 0;
-    uint64_t vulkan_attention_precondition_failures = 0;
-    uint64_t vulkan_attention_staging_failures = 0;
-    uint64_t vulkan_attention_norm_failures = 0;
-    uint64_t vulkan_attention_qkv_failures = 0;
-    uint64_t vulkan_attention_cache_failures = 0;
-    uint64_t vulkan_attention_sdpa_failures = 0;
-    uint64_t vulkan_attention_projection_failures = 0;
-    uint64_t vulkan_attention_output_failures = 0;
-    uint64_t vulkan_attention_submit_failures = 0;
     uint64_t vulkan_attention_cache_materializations = 0;
     uint64_t vulkan_attention_cpu_fallbacks = 0;
     uint64_t vulkan_gated_delta_fusions = 0;
@@ -329,17 +228,16 @@ struct RuntimeMetricCounters
     uint64_t expert_gpu_cache_admissions = 0;
     uint64_t expert_gpu_cache_stores = 0;
     uint64_t expert_gpu_cache_dropped_admissions = 0;
-    uint64_t expert_gpu_cache_resident_bytes = 0;
-    uint64_t expert_gpu_cache_pending_bytes = 0;
+    uint64_t expert_gpu_cache_resident_size = 0;
+    uint64_t expert_gpu_cache_pending_size = 0;
     uint64_t expert_gpu_executions = 0;
     uint64_t expert_gpu_execution_failures = 0;
-    uint64_t expert_gpu_cpu_preferred = 0;
     uint64_t expert_gpu_route_aggregation_batches = 0;
     uint64_t expert_gpu_route_aggregation_routes = 0;
     uint64_t expert_gpu_route_aggregation_bytes_saved = 0;
-    uint64_t expert_cache_resident_bytes = 0;
-    uint64_t kv_cache_logical_bytes = 0;
-    uint64_t kv_cache_allocated_bytes = 0;
+    uint64_t expert_cache_resident_size = 0;
+    uint64_t kv_cache_logical_size = 0;
+    uint64_t kv_cache_allocated_size = 0;
 };
 
 struct GenerationTimingMetrics
@@ -368,67 +266,73 @@ struct SessionMetrics
 
 struct SessionOptions
 {
-    LogitsOutputMode logits_output_mode = LogitsOutputMode::FullLogits;
     uint64_t sampling_seed = 0;
     uint32_t prefill_chunk_size = 512;
-    bool enable_speculative_context = true;
+    bool use_speculative_context = true;
 };
 
 class Session
 {
-private:
-    explicit Session(ModelPtr model, const SessionOptions& options);
-    [[nodiscard]] Result<PrefillResult> prefill_unlocked(std::span<const int32_t> input_ids);
-    [[nodiscard]] Result<DecodeResult> decode_unlocked(int32_t input_id);
-    [[nodiscard]] Result<SampledToken> sample_unlocked(std::span<const float> logits, const SamplingOptions& options);
-    [[nodiscard]] Result<SampledToken> sample_unlocked(const LogitsOutput& logits, const SamplingOptions& options);
-
-    ModelPtr model_;
-    uint64_t sequence_length_ = 0;
-    SessionStatistics statistics_;
-    SessionStatistics statistics_scratch_;
-    std::unique_ptr<CpuSessionState> state_;
-    std::unique_ptr<IExecutor> executor_;
-    std::mt19937_64 random_generator_;
-    uint32_t prefill_chunk_size_ = 512;
-    bool speculative_context_enabled_ = true;
-    SessionStatistics generation_start_statistics_;
-    bool generation_active_ = false;
-    uint64_t generation_input_tokens_ = 0;
-    uint64_t generation_output_tokens_ = 0;
-    uint64_t generation_elapsed_microseconds_ = 0;
-    bool generation_has_first_token_ = false;
-    std::chrono::steady_clock::time_point generation_started_;
-    std::chrono::steady_clock::time_point generation_first_token_ready_;
-    mutable std::mutex mutex_;
-    std::unique_ptr<SamplingScratch> sampling_scratch_;
-
-    [[nodiscard]] SessionMetrics metrics_unlocked() const;
-
-    friend class Runtime;
-    friend class SessionBatchAccess;
-
 public:
     ~Session();
 
+    // Argument validation leaves the session usable; an execution failure may
+    // leave partial state and requires reset before another operation.
     [[nodiscard]] Result<PrefillResult> prefill(std::span<const int32_t> input_ids);
     [[nodiscard]] Result<DecodeResult> decode(int32_t input_id);
-    [[nodiscard]] Result<SampledToken> sample(const LogitsOutput& logits, const SamplingOptions& options = {});
-    [[nodiscard]] Result<GenerationResult> generate(std::span<const int32_t> input_ids, const GenerationOptions& options = {}, TokenStreamCallback on_token = {}, TokenTextDecoder decode_text = {});
+    [[nodiscard]] Result<SampledToken> sample(std::span<const float> logits, const SamplingOptions& opt = {});
+    [[nodiscard]] Result<GenerationResult> generate(std::span<const int32_t> input_ids, const GenerationOptions& opt = {}, TokenStreamCallback on_token = {}, TokenTextDecoder decode_text = {});
     [[nodiscard]] Result<void> reset();
 
     [[nodiscard]] uint64_t sequence_length() const noexcept
     {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        return sequence_length_;
+        const std::lock_guard<std::mutex> lock(mutex);
+        return token_count;
     }
     [[nodiscard]] SessionStatistics statistics() const
     {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        return statistics_;
+        const std::lock_guard<std::mutex> lock(mutex);
+        return stats;
     }
     [[nodiscard]] SessionMetrics metrics() const;
-    [[nodiscard]] MemoryManagerStatistics memory_statistics() const;
+
+private:
+    explicit Session(ModelPtr _model, const SessionOptions& opt);
+    [[nodiscard]] static uint32_t context_limit(const MoeModelDescriptor& descriptor) noexcept;
+    [[nodiscard]] Result<void> prefill_unlocked(std::span<const int32_t> input_ids);
+    [[nodiscard]] Result<void> decode_unlocked(int32_t input_id);
+    [[nodiscard]] Result<SampledToken> sample_unlocked(std::span<const float> logits, const SamplingOptions& opt);
+    [[nodiscard]] Result<GenerationResult> generate_unlocked(std::span<const int32_t> input_ids, const GenerationOptions& opt, const TokenStreamCallback& on_token, const TokenTextDecoder& decode_text, std::unique_lock<std::mutex>& lock);
+    [[nodiscard]] Result<GenerationResult> generate_speculative(const GenerationOptions& opt, const TokenStreamCallback& on_token, const TokenTextDecoder& decode_text, std::unique_lock<std::mutex>& lock);
+    [[nodiscard]] Result<bool> emit_token(StreamToken& token, const TokenStreamCallback& on_token, const TokenTextDecoder& decode_text, std::unique_lock<std::mutex>& lock);
+    void begin_generation(uint64_t input_tokens);
+    void finish_generation() noexcept;
+    // Publish counters and position; callers still own cache transactions.
+    void commit_execution(uint64_t prefill_tokens, uint64_t decode_tokens);
+
+    ModelPtr model;
+    uint64_t token_count = 0;
+    SessionStatistics stats;
+    // Tentative execution counters are published when the step commits.
+    SessionStatistics stats_scratch;
+    std::unique_ptr<SessionState> state;
+    std::mt19937_64 random_generator;
+    uint32_t prefill_chunk_size = 512;
+    bool use_speculative_context = true;
+    RuntimeMetricCounters generation_start_counters;
+    bool generation_active = false;
+    uint64_t generation_input_tokens = 0;
+    uint64_t generation_output_tokens = 0;
+    uint64_t generation_elapsed_microseconds = 0;
+    std::chrono::steady_clock::time_point generation_start_time;
+    std::chrono::steady_clock::time_point generation_first_token_time;
+    mutable std::mutex mutex;
+    std::vector<int32_t> sampling_token_ids;
+    std::array<std::vector<SampledToken>, 2> sampling_candidates;
+    std::vector<float> sampling_residual;
+
+    friend class Runtime;
+    friend class BatchSchedulerPrivate;
 };
 
 using SessionPtr = std::shared_ptr<Session>;

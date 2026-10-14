@@ -74,7 +74,7 @@ def inspect_compiled_artifact(model):
     }
 
 
-def parse_arguments():
+def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(
         description=(
             "Benchmark an ncnn_moe model runner with repeatable runtime, "
@@ -154,39 +154,10 @@ def parse_arguments():
         ),
     )
     parser.add_argument(
-        "--scheduler-expert-threads",
-        type=int,
-        default=0,
-        help=(
-            "Override Expert OpenMP threads per scheduler worker "
-            "(zero keeps the runner's topology default)."
-        ),
-    )
-    parser.add_argument(
         "--scheduler-staging",
-        choices=("auto", "force", "off"),
+        choices=("auto", "off"),
         default="auto",
         help="Control cross-session staged decode batching.",
-    )
-    parser.add_argument(
-        "--scheduler-cross-call",
-        action="store_true",
-        help=(
-            "Submit each Session as an independent scheduler call so the "
-            "Runtime cross-call collector is exercised."
-        ),
-    )
-    parser.add_argument(
-        "--scheduler-collection-us",
-        type=int,
-        default=200,
-        help="Maximum cross-call collection window in microseconds.",
-    )
-    parser.add_argument(
-        "--scheduler-max-micro-batch",
-        type=int,
-        default=0,
-        help="Maximum collected requests; zero follows scheduler workers.",
     )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument(
@@ -308,7 +279,7 @@ def parse_arguments():
         "--json-output",
         help="Optional path for the complete machine-readable report.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def validate_arguments(arguments):
@@ -362,27 +333,6 @@ def validate_arguments(arguments):
         or arguments.parallel_sessions > 64
     ):
         raise ValueError("--parallel-sessions must be between 1 and 64")
-    if (
-        arguments.scheduler_expert_threads < 0
-        or arguments.scheduler_expert_threads > 1024
-    ):
-        raise ValueError(
-            "--scheduler-expert-threads must be between 0 and 1024"
-        )
-    if (
-        arguments.scheduler_collection_us < 0
-        or arguments.scheduler_collection_us > 1000000
-    ):
-        raise ValueError(
-            "--scheduler-collection-us must be between 0 and 1000000"
-        )
-    if (
-        arguments.scheduler_max_micro_batch < 0
-        or arguments.scheduler_max_micro_batch > 1024
-    ):
-        raise ValueError(
-            "--scheduler-max-micro-batch must be between 0 and 1024"
-        )
     if arguments.repeats <= 0:
         raise ValueError("--repeats must be positive")
     if (
@@ -524,31 +474,8 @@ def runner_command(arguments):
         command.extend(
             ["--parallel-sessions", str(arguments.parallel_sessions)]
         )
-    if arguments.scheduler_expert_threads:
-        command.extend(
-            [
-                "--scheduler-expert-threads",
-                str(arguments.scheduler_expert_threads),
-            ]
-        )
     if arguments.scheduler_staging != "auto":
         command.extend(["--scheduler-staging", arguments.scheduler_staging])
-    if arguments.scheduler_cross_call:
-        command.append("--scheduler-cross-call")
-    if arguments.scheduler_collection_us != 200:
-        command.extend(
-            [
-                "--scheduler-collection-us",
-                str(arguments.scheduler_collection_us),
-            ]
-        )
-    if arguments.scheduler_max_micro_batch:
-        command.extend(
-            [
-                "--scheduler-max-micro-batch",
-                str(arguments.scheduler_max_micro_batch),
-            ]
-        )
     if arguments.backend != "auto":
         command.append(f"--{arguments.backend}")
     if arguments.expert_memory != "auto":
@@ -1043,35 +970,16 @@ def parse_runner_output(output):
         if token_match
         else []
     )
-    hotsets = [
-        {
-            "capacity_mib": int(match.group(1)),
-            "resident_experts": int(match.group(2)),
-            "active_experts": int(match.group(3)),
-            "resident_bytes": int(match.group(4)),
-            "batch_weight_coverage": float(match.group(5)) / 100.0,
-            "route_weight_coverage": float(match.group(6)) / 100.0,
-        }
-        for match in re.finditer(
-            r"^Expert static hotset at (\d+) MiB: "
-            r"(\d+)/(\d+) Expert\(s\), (\d+) bytes resident, "
-            r"([0-9.]+)% batch-byte coverage, "
-            r"([0-9.]+)% route-byte coverage$",
-            output,
-            re.MULTILINE,
-        )
-    ]
     route_ranks = [
         {
             "rank": int(match.group(1)),
             "predictions": int(match.group(2)),
             "matches": int(match.group(3)),
             "demands": int(match.group(4)),
-            "demand_queue_time_us": int(match.group(5)),
         }
         for match in re.finditer(
             r"\br(\d+) (\d+) predicted/(\d+) matched/"
-            r"(\d+) demanded/(\d+)us queued;",
+            r"(\d+) demanded;",
             output,
         )
     ]
@@ -1104,11 +1012,6 @@ def parse_runner_output(output):
         "generation_seconds": extract_number(
             output, r"^generated \d+ token\(s\) in ([0-9.]+) s"
         ),
-        "attention_ms": extract_number(
-            output, r"^Attention time: ([0-9.]+) ms"
-        ),
-        "router_ms": extract_number(output, r"^Router time: ([0-9.]+) ms"),
-        "expert_ms": extract_number(output, r"^Expert time: ([0-9.]+) ms"),
         "expert_batch_weight_bytes": extract_number(
             output, r"^Expert weight demand: (\d+) batched bytes", int
         ),
@@ -1116,36 +1019,6 @@ def parse_runner_output(output):
             output,
             r"^Expert weight demand: \d+ batched bytes, (\d+) route bytes",
             int,
-        ),
-        "expert_cache_wait_ms": extract_number(
-            output, r"^Expert cache wait time: ([0-9.]+) ms"
-        ),
-        "expert_cache_management_ms": extract_number(
-            output, r"^Expert cache management time: ([0-9.]+) ms"
-        ),
-        "expert_engine_ms": extract_number(
-            output, r"^Expert engine wall time: ([0-9.]+) ms"
-        ),
-        "expert_compute_ms": extract_number(
-            output, r"^Expert compute(?: wall)? time: ([0-9.]+) ms"
-        ),
-        "expert_orchestration_ms": extract_number(
-            output, r"^Expert orchestration wall time: ([0-9.]+) ms"
-        ),
-        "expert_regroup_ms": extract_number(
-            output, r"^Expert regroup time: ([0-9.]+) ms"
-        ),
-        "expert_combine_ms": extract_number(
-            output, r"^Expert combine time: ([0-9.]+) ms"
-        ),
-        "embedding_ms": extract_number(
-            output, r"^Embedding time: ([0-9.]+) ms"
-        ),
-        "final_norm_ms": extract_number(
-            output, r"^Final norm time: ([0-9.]+) ms"
-        ),
-        "lm_head_ms": extract_number(
-            output, r"^LM head time: ([0-9.]+) ms"
         ),
         "speculative_proposals": extract_number(
             output, r"^Speculative decoding: (\d+) proposal", int
@@ -1160,18 +1033,6 @@ def parse_runner_output(output):
             r"^Speculative decoding: \d+ proposal\(s\), \d+ draft token\(s\), "
             r"(\d+) accepted token",
             int,
-        ),
-        "speculative_context_ms": extract_number(
-            output, r"^Speculative time: ([0-9.]+) ms context"
-        ),
-        "speculative_draft_ms": extract_number(
-            output,
-            r"^Speculative time: [0-9.]+ ms context, ([0-9.]+) ms draft",
-        ),
-        "speculative_verify_ms": extract_number(
-            output,
-            r"^Speculative time: [0-9.]+ ms context, [0-9.]+ ms draft, "
-            r"([0-9.]+) ms verify",
         ),
         "physical_cpu_core_count": extract_number(
             output, r"^CPU topology: (\d+) physical core", int
@@ -1196,8 +1057,8 @@ def parse_runner_output(output):
         "bfloat16_batched_linear_kernel": extract_text(
             output, r"^BF16 batched CPU Linear kernel: (.+)$"
         ),
-        "cpu_small_bfloat16_linear_policy": extract_text(
-            output, r"^BF16 small CPU Linear policy: (.+)$"
+        "cpu_linear_backend": extract_text(
+            output, r"^CPU Linear backend: (.+)$"
         ),
         "mxfp4_decode_row_pair_group_size": extract_number(
             output, r"^MXFP4 decode row-pair group: (\d+)", int
@@ -1233,29 +1094,6 @@ def parse_runner_output(output):
             r"^Vulkan batch (?:transfers|boundary requests): \d+ (?:upload\(s\)|host->device), (\d+) (?:download|device->host)",
             int,
         ),
-        "vulkan_direct_host_input_bindings": extract_number(
-            output,
-            r"^Vulkan direct host bind(?:ings|ing attempts): (\d+) input",
-            int,
-        ),
-        "vulkan_direct_host_output_bindings": extract_number(
-            output,
-            r"^Vulkan direct host bind(?:ings|ing attempts): \d+ input\(s\), (\d+) output",
-            int,
-        ),
-        "vulkan_submit_wait_ms": extract_number(
-            output, r"^Vulkan submit/wait time: ([0-9.eE+-]+) ms", float
-        ),
-        "vulkan_auxiliary_uploads": extract_number(
-            output,
-            r"^Vulkan auxiliary uploads: (\d+) upload",
-            int,
-        ),
-        "vulkan_auxiliary_upload_bytes": extract_number(
-            output,
-            r"^Vulkan auxiliary uploads: \d+ upload\(s\), (\d+) bytes",
-            int,
-        ),
         "vulkan_model_device_index": extract_number(
             output, r"^Vulkan model device: (\d+)", int
         ),
@@ -1268,64 +1106,8 @@ def parse_runner_output(output):
         "vulkan_attention_blocks": extract_number(
             output, r"^Vulkan attention blocks: (\d+)", int
         ),
-        "vulkan_attention_batch_submissions": extract_number(
-            output, r"^Vulkan attention batching: (\d+) submission", int
-        ),
-        "vulkan_attention_batch_rows": extract_number(
-            output,
-            r"^Vulkan attention batching: \d+ submission\(s\), (\d+) row",
-            int,
-        ),
-        "vulkan_attention_batch_avoided_submissions": extract_number(
-            output,
-            r"^Vulkan attention batching: \d+ submission\(s\), \d+ row\(s\), (\d+) submission",
-            int,
-        ),
         "vulkan_kernel_features": extract_text(
             output, r"^Vulkan kernel features: (.+)$"
-        ),
-        "vulkan_command_buffer_reuses": extract_number(
-            output,
-            r"^Vulkan command buffer reuses: (\d+)",
-            int,
-        ),
-        "vulkan_command_dispatches": extract_number(
-            output, r"^Vulkan command recording: (\d+) dispatch", int
-        ),
-        "vulkan_command_pipeline_binds": extract_number(
-            output,
-            r"^Vulkan command recording: \d+ dispatch\(es\), (\d+) pipeline bind",
-            int,
-        ),
-        "vulkan_command_descriptor_bindings": extract_number(
-            output,
-            r"^Vulkan command recording: \d+ dispatch\(es\), \d+ pipeline bind\(s\), (\d+) descriptor binding",
-            int,
-        ),
-        "vulkan_command_push_constant_updates": extract_number(
-            output,
-            r"^Vulkan command recording: \d+ dispatch\(es\), \d+ pipeline bind\(s\), \d+ descriptor binding\(s\), (\d+) push constant update",
-            int,
-        ),
-        "vulkan_command_resource_barrier_calls": extract_number(
-            output,
-            r"^Vulkan command recording: .*?, (\d+) resource barrier call",
-            int,
-        ),
-        "vulkan_command_buffer_resource_barriers": extract_number(
-            output,
-            r"^Vulkan command recording: .*?, (\d+) buffer barrier",
-            int,
-        ),
-        "vulkan_command_image_resource_barriers": extract_number(
-            output,
-            r"^Vulkan command recording: .*?, (\d+) image barrier",
-            int,
-        ),
-        "vulkan_command_redundant_pipeline_binds": extract_number(
-            output,
-            r"^Vulkan command recording: .*?, (\d+) redundant pipeline bind candidate",
-            int,
         ),
         "vulkan_attention_qkv_rope_fusions": extract_number(
             output,
@@ -1361,161 +1143,25 @@ def parse_runner_output(output):
         "vulkan_kv_ring_appends": extract_number(
             output, r"^Vulkan KV ring: (\d+) append", int
         ),
-        "vulkan_kv_ring_resizes": extract_number(
-            output, r"^Vulkan KV ring: \d+ append\(s\), (\d+) resize", int
+        "scheduler_num_threads": extract_number(
+            output, r"^Scheduler threads: (\d+)", int
         ),
-        "vulkan_kv_ring_wrapped_views": extract_number(
+        "scheduler_prefill_batches": extract_number(
+            output, r"^Scheduler batches: (\d+) prefill", int
+        ),
+        "scheduler_staged_prefill_batches": extract_number(
             output,
-            r"^Vulkan KV ring: \d+ append\(s\), \d+ resize\(s\), (\d+) wrapped",
+            r"^Scheduler batches: \d+ prefill \((\d+) staged\)",
             int,
         ),
-        "vulkan_kv_cache_promotions": extract_number(
-            output, r"^Vulkan KV cache promotion: (\d+) promotion", int
-        ),
-        "vulkan_kv_cache_promotion_bytes": extract_number(
+        "scheduler_decode_batches": extract_number(
             output,
-            r"^Vulkan KV cache promotion: \d+ promotion\(s\), (\d+) bytes",
+            r"^Scheduler batches: \d+ prefill \(\d+ staged\), (\d+) decode",
             int,
         ),
-        "scheduler_staged_batches": extract_number(
-            output, r"^Scheduler staging: (\d+) batch", int
-        ),
-        "scheduler_staged_requests": extract_number(
+        "scheduler_staged_decode_batches": extract_number(
             output,
-            r"^Scheduler staging: \d+ batch\(es\), (\d+) request",
-            int,
-        ),
-        "scheduler_staging_bypassed_batches": extract_number(
-            output,
-            r"^Scheduler staging: \d+ batch\(es\), \d+ request\(s\), (\d+) bypassed",
-            int,
-        ),
-        "scheduler_logical_expert_batches": extract_number(
-            output,
-            r"^Scheduler staging:.*?(\d+) logical Expert batch",
-            int,
-        ),
-        "scheduler_physical_expert_batches": extract_number(
-            output,
-            r"^Scheduler staging:.*?-> (\d+) physical",
-            int,
-        ),
-        "scheduler_coalesced_expert_routes": extract_number(
-            output,
-            r"^Scheduler staging:.*?(\d+) coalesced route",
-            int,
-        ),
-        "scheduler_max_coalesced_expert_batch_size": extract_number(
-            output,
-            r"^Scheduler staging:.*?max (\d+) row",
-            int,
-        ),
-        "scheduler_adaptive_staged_decisions": extract_number(
-            output,
-            r"^Scheduler adaptive policy: (\d+) staged decision",
-            int,
-        ),
-        "scheduler_adaptive_independent_decisions": extract_number(
-            output,
-            r"^Scheduler adaptive policy: \d+ staged decision\(s\), (\d+) independent",
-            int,
-        ),
-        "scheduler_adaptive_probe_decisions": extract_number(
-            output,
-            r"^Scheduler adaptive policy:.*?(\d+) probe",
-            int,
-        ),
-        "scheduler_adaptive_policy_switches": extract_number(
-            output,
-            r"^Scheduler adaptive policy:.*?(\d+) switch",
-            int,
-        ),
-        "scheduler_adaptive_staged_ms_per_request": extract_number(
-            output,
-            r"^Scheduler adaptive policy:.*?([0-9.]+)/[0-9.]+ mean ms/request",
-        ),
-        "scheduler_adaptive_independent_ms_per_request": extract_number(
-            output,
-            r"^Scheduler adaptive policy:.*?[0-9.]+/([0-9.]+) mean ms/request",
-        ),
-        "scheduler_adaptive_resident_decisions": extract_number(
-            output,
-            r"^Scheduler adaptive phases: (\d+)/",
-            int,
-        ),
-        "scheduler_adaptive_mixed_decisions": extract_number(
-            output,
-            r"^Scheduler adaptive phases: \d+/(\d+)/",
-            int,
-        ),
-        "scheduler_adaptive_storage_decisions": extract_number(
-            output,
-            r"^Scheduler adaptive phases: \d+/\d+/(\d+) resident",
-            int,
-        ),
-        "scheduler_adaptive_resident_observations": extract_number(
-            output,
-            r"^Scheduler adaptive phases:.*?, (\d+)/\d+/\d+ observation",
-            int,
-        ),
-        "scheduler_adaptive_mixed_observations": extract_number(
-            output,
-            r"^Scheduler adaptive phases:.*?, \d+/(\d+)/\d+ observation",
-            int,
-        ),
-        "scheduler_adaptive_storage_observations": extract_number(
-            output,
-            r"^Scheduler adaptive phases:.*?, \d+/\d+/(\d+) observation",
-            int,
-        ),
-        "scheduler_adaptive_phase_changes": extract_number(
-            output,
-            r"^Scheduler adaptive phases:.*?(\d+) phase change",
-            int,
-        ),
-        "scheduler_adaptive_noisy_switch_rejections": extract_number(
-            output,
-            r"^Scheduler adaptive phases:.*?(\d+) noisy switch rejection",
-            int,
-        ),
-        "scheduler_cross_call_collected_batches": extract_number(
-            output,
-            r"^Scheduler cross-call: (\d+) collected batch",
-            int,
-        ),
-        "scheduler_cross_call_collected_requests": extract_number(
-            output,
-            r"^Scheduler cross-call: \d+ collected batch\(es\), (\d+) collected request",
-            int,
-        ),
-        "scheduler_cross_call_collection_probes": extract_number(
-            output,
-            r"^Scheduler cross-call:.*?(\d+) probe",
-            int,
-        ),
-        "scheduler_cross_call_collection_timeouts": extract_number(
-            output,
-            r"^Scheduler cross-call:.*?(\d+) timeout",
-            int,
-        ),
-        "scheduler_cross_call_collection_bypasses": extract_number(
-            output,
-            r"^Scheduler cross-call:.*?(\d+) bypass",
-            int,
-        ),
-        "scheduler_cross_call_collection_wait_us": extract_number(
-            output,
-            r"^Scheduler cross-call:.*?(\d+) us waiting",
-            int,
-        ),
-        "scheduler_cross_call_max_batch_size": extract_number(
-            output,
-            r"^Scheduler cross-call:.*?max batch (\d+)",
-            int,
-        ),
-        "scheduler_cross_call_max_pending": extract_number(
-            output,
-            r"^Scheduler cross-call:.*?max pending (\d+)",
+            r"^Scheduler batches: \d+ prefill \(\d+ staged\), \d+ decode \((\d+) staged\)",
             int,
         ),
         "expert_route_predictions": extract_number(
@@ -1537,14 +1183,6 @@ def parse_runner_output(output):
             output,
             r"^Expert route prediction:.*?(\d+) not-ready",
             int,
-        ),
-        "expert_route_prediction_ms": extract_number(
-            output,
-            r"^Expert route prediction:.*?([0-9.]+) ms predictor",
-        ),
-        "expert_route_prediction_wait_ms": extract_number(
-            output,
-            r"^Expert route prediction:.*?([0-9.]+) ms waiting",
         ),
         "expert_route_prediction_async_submissions": extract_number(
             output,
@@ -1664,16 +1302,7 @@ def parse_runner_output(output):
             output, r"^Expert I/O policy:.*?(\d+) physical range\(s\) saved", int
         ),
         "expert_cache_io_worker_count": extract_number(
-            output, r"^Expert I/O policy:.*?io workers: (\d+) target", int
-        ),
-        "expert_cache_adaptive_io_workers": extract_number(
-            output, r"^Expert I/O policy:.*?io workers: \d+ target (\d+)", int
-        ),
-        "expert_cache_io_read_samples": extract_number(
-            output, r"^Expert I/O policy:.*?target \d+, (\d+) sample", int
-        ),
-        "expert_cache_io_read_time_ms": extract_number(
-            output, r"^Expert I/O policy:.*?sample\(s\), ([0-9.]+) ms observed", float
+            output, r"^Expert I/O policy:.*?io workers: (\d+)$", int
         ),
         "expert_gpu_cache_hits": extract_number(
             output, r"^Expert GPU execution cache: (\d+) hit", int
@@ -1758,9 +1387,6 @@ def parse_runner_output(output):
         "expert_gpu_victim_cache_bytes_downloaded": extract_number(
             output, r"^Expert GPU victim cache:.*?(\d+) bytes downloaded", int
         ),
-        "expert_gpu_victim_cache_restore_ms": extract_number(
-            output, r"^Expert GPU victim cache:.*?([0-9.]+) ms restoring"
-        ),
         "expert_gpu_victim_cache_mapped_stores": extract_number(
             output, r"^Expert GPU victim cache:.*?(\d+) mapped store", int
         ),
@@ -1778,12 +1404,6 @@ def parse_runner_output(output):
         ),
         "expert_gpu_execution_failures": extract_number(
             output, r"^Expert GPU execution:.*?(\d+) failure", int
-        ),
-        "expert_gpu_cpu_preferred": extract_number(
-            output, r"^Expert GPU execution:.*?(\d+) CPU-preferred", int
-        ),
-        "expert_gpu_execution_ms": extract_number(
-            output, r"^Expert GPU execution:.*?([0-9.]+) ms executing"
         ),
         "expert_gpu_route_aggregation_batches": extract_number(
             output, r"^Expert GPU route aggregation: (\d+) batch", int
@@ -1827,7 +1447,6 @@ def parse_runner_output(output):
         "expert_gpu_arc_frequent_ghost_bytes": extract_number(
             output, r"^Expert GPU ARC:.*?(\d+) frequent ghost byte", int
         ),
-        "expert_static_hotsets": hotsets,
         "generated_token_ids": tokens,
     }
     def has_positive(field):
@@ -1848,7 +1467,6 @@ def parse_runner_output(output):
         for field in (
             "vulkan_batch_uploads",
             "vulkan_batch_downloads",
-            "vulkan_auxiliary_uploads",
             "expert_gpu_cache_bytes_uploaded",
             "expert_gpu_victim_cache_bytes_uploaded",
         )
@@ -2084,7 +1702,6 @@ def median_route_ranks(samples):
                     "predictions": [],
                     "matches": [],
                     "demands": [],
-                    "demand_queue_time_us": [],
                 },
             )
             for field in aggregate:
@@ -2183,8 +1800,6 @@ def run_cache_sweep(arguments):
                 "speculative_accepted_tokens": median[
                     "speculative_accepted_tokens"
                 ],
-                "speculative_draft_ms": median["speculative_draft_ms"],
-                "speculative_verify_ms": median["speculative_verify_ms"],
             }
         )
 
@@ -2405,9 +2020,7 @@ def main():
             "bfloat16_batched_linear_kernel": samples[0][
                 "bfloat16_batched_linear_kernel"
             ],
-            "cpu_small_bfloat16_linear_policy": samples[0][
-                "cpu_small_bfloat16_linear_policy"
-            ],
+            "cpu_linear_backend": samples[0]["cpu_linear_backend"],
             "cpu_isa": samples[0]["cpu_isa"],
             "mxfp4_decode_row_pair_group_size": samples[0][
                 "mxfp4_decode_row_pair_group_size"
@@ -2440,15 +2053,7 @@ def main():
         "warmup_runs": arguments.warmup,
         "cache_warmup_runs": arguments.cache_warmup_runs,
         "parallel_sessions": arguments.parallel_sessions,
-        "scheduler_expert_threads": arguments.scheduler_expert_threads,
         "scheduler_staging": arguments.scheduler_staging,
-        "scheduler_cross_call": arguments.scheduler_cross_call,
-        "scheduler_collection_us": (
-            arguments.scheduler_collection_us
-        ),
-        "scheduler_max_micro_batch": (
-            arguments.scheduler_max_micro_batch
-        ),
         "expert_gpu_cache_mb": arguments.expert_gpu_cache_mb,
         "expert_gpu_victim_cache_mb": (
             arguments.expert_gpu_victim_cache_mb
@@ -2466,9 +2071,6 @@ def main():
             "reported_aggregate_tokens_per_second": median_field(
                 samples, "reported_aggregate_tokens_per_second"
             ),
-            "attention_ms": median_field(samples, "attention_ms"),
-            "router_ms": median_field(samples, "router_ms"),
-            "expert_ms": median_field(samples, "expert_ms"),
             "expert_batch_weight_bytes": median_field(
                 samples, "expert_batch_weight_bytes"
             ),
@@ -2483,33 +2085,6 @@ def main():
                 samples,
                 "required_pcie_gib_per_second_at_20_tps",
             ),
-            "expert_static_hotsets": samples[-1][
-                "expert_static_hotsets"
-            ],
-            "expert_cache_wait_ms": median_field(
-                samples, "expert_cache_wait_ms"
-            ),
-            "expert_cache_management_ms": median_field(
-                samples, "expert_cache_management_ms"
-            ),
-            "expert_engine_ms": median_field(
-                samples, "expert_engine_ms"
-            ),
-            "expert_compute_ms": median_field(
-                samples, "expert_compute_ms"
-            ),
-            "expert_orchestration_ms": median_field(
-                samples, "expert_orchestration_ms"
-            ),
-            "expert_regroup_ms": median_field(
-                samples, "expert_regroup_ms"
-            ),
-            "expert_combine_ms": median_field(
-                samples, "expert_combine_ms"
-            ),
-            "embedding_ms": median_field(samples, "embedding_ms"),
-            "final_norm_ms": median_field(samples, "final_norm_ms"),
-            "lm_head_ms": median_field(samples, "lm_head_ms"),
             "speculative_proposals": median_field(
                 samples, "speculative_proposals"
             ),
@@ -2518,15 +2093,6 @@ def main():
             ),
             "speculative_accepted_tokens": median_field(
                 samples, "speculative_accepted_tokens"
-            ),
-            "speculative_context_ms": median_field(
-                samples, "speculative_context_ms"
-            ),
-            "speculative_draft_ms": median_field(
-                samples, "speculative_draft_ms"
-            ),
-            "speculative_verify_ms": median_field(
-                samples, "speculative_verify_ms"
             ),
             "vulkan_linear_dispatches": median_field(
                 samples, "vulkan_linear_dispatches"
@@ -2543,48 +2109,6 @@ def main():
             "vulkan_batch_downloads": median_field(
                 samples, "vulkan_batch_downloads"
             ),
-            "vulkan_direct_host_input_bindings": median_field(
-                samples, "vulkan_direct_host_input_bindings"
-            ),
-            "vulkan_direct_host_output_bindings": median_field(
-                samples, "vulkan_direct_host_output_bindings"
-            ),
-            "vulkan_submit_wait_ms": median_field(
-                samples, "vulkan_submit_wait_ms"
-            ),
-            "vulkan_auxiliary_uploads": median_field(
-                samples, "vulkan_auxiliary_uploads"
-            ),
-            "vulkan_auxiliary_upload_bytes": median_field(
-                samples, "vulkan_auxiliary_upload_bytes"
-            ),
-            "vulkan_command_buffer_reuses": median_field(
-                samples, "vulkan_command_buffer_reuses"
-            ),
-            "vulkan_command_dispatches": median_field(
-                samples, "vulkan_command_dispatches"
-            ),
-            "vulkan_command_pipeline_binds": median_field(
-                samples, "vulkan_command_pipeline_binds"
-            ),
-            "vulkan_command_descriptor_bindings": median_field(
-                samples, "vulkan_command_descriptor_bindings"
-            ),
-            "vulkan_command_push_constant_updates": median_field(
-                samples, "vulkan_command_push_constant_updates"
-            ),
-            "vulkan_command_resource_barrier_calls": median_field(
-                samples, "vulkan_command_resource_barrier_calls"
-            ),
-            "vulkan_command_buffer_resource_barriers": median_field(
-                samples, "vulkan_command_buffer_resource_barriers"
-            ),
-            "vulkan_command_image_resource_barriers": median_field(
-                samples, "vulkan_command_image_resource_barriers"
-            ),
-            "vulkan_command_redundant_pipeline_binds": median_field(
-                samples, "vulkan_command_redundant_pipeline_binds"
-            ),
             "vulkan_attention_qkv_rope_fusions": median_field(
                 samples, "vulkan_attention_qkv_rope_fusions"
             ),
@@ -2600,15 +2124,6 @@ def main():
             "vulkan_attention_blocks": median_field(
                 samples, "vulkan_attention_blocks"
             ),
-            "vulkan_attention_batch_submissions": median_field(
-                samples, "vulkan_attention_batch_submissions"
-            ),
-            "vulkan_attention_batch_rows": median_field(
-                samples, "vulkan_attention_batch_rows"
-            ),
-            "vulkan_attention_batch_avoided_submissions": median_field(
-                samples, "vulkan_attention_batch_avoided_submissions"
-            ),
             "vulkan_gated_delta_fusions": median_field(
                 samples, "vulkan_gated_delta_fusions"
             ),
@@ -2621,104 +2136,20 @@ def main():
             "vulkan_kv_ring_appends": median_field(
                 samples, "vulkan_kv_ring_appends"
             ),
-            "vulkan_kv_ring_resizes": median_field(
-                samples, "vulkan_kv_ring_resizes"
+            "scheduler_num_threads": median_field(
+                samples, "scheduler_num_threads"
             ),
-            "vulkan_kv_ring_wrapped_views": median_field(
-                samples, "vulkan_kv_ring_wrapped_views"
+            "scheduler_prefill_batches": median_field(
+                samples, "scheduler_prefill_batches"
             ),
-            "vulkan_kv_cache_promotions": median_field(
-                samples, "vulkan_kv_cache_promotions"
+            "scheduler_staged_prefill_batches": median_field(
+                samples, "scheduler_staged_prefill_batches"
             ),
-            "vulkan_kv_cache_promotion_bytes": median_field(
-                samples, "vulkan_kv_cache_promotion_bytes"
+            "scheduler_decode_batches": median_field(
+                samples, "scheduler_decode_batches"
             ),
-            "scheduler_staged_batches": median_field(
-                samples, "scheduler_staged_batches"
-            ),
-            "scheduler_staged_requests": median_field(
-                samples, "scheduler_staged_requests"
-            ),
-            "scheduler_staging_bypassed_batches": median_field(
-                samples, "scheduler_staging_bypassed_batches"
-            ),
-            "scheduler_logical_expert_batches": median_field(
-                samples, "scheduler_logical_expert_batches"
-            ),
-            "scheduler_physical_expert_batches": median_field(
-                samples, "scheduler_physical_expert_batches"
-            ),
-            "scheduler_coalesced_expert_routes": median_field(
-                samples, "scheduler_coalesced_expert_routes"
-            ),
-            "scheduler_max_coalesced_expert_batch_size": median_field(
-                samples, "scheduler_max_coalesced_expert_batch_size"
-            ),
-            "scheduler_adaptive_staged_decisions": median_field(
-                samples, "scheduler_adaptive_staged_decisions"
-            ),
-            "scheduler_adaptive_independent_decisions": median_field(
-                samples, "scheduler_adaptive_independent_decisions"
-            ),
-            "scheduler_adaptive_probe_decisions": median_field(
-                samples, "scheduler_adaptive_probe_decisions"
-            ),
-            "scheduler_adaptive_policy_switches": median_field(
-                samples, "scheduler_adaptive_policy_switches"
-            ),
-            "scheduler_adaptive_staged_ms_per_request": median_field(
-                samples, "scheduler_adaptive_staged_ms_per_request"
-            ),
-            "scheduler_adaptive_independent_ms_per_request": median_field(
-                samples, "scheduler_adaptive_independent_ms_per_request"
-            ),
-            "scheduler_adaptive_resident_decisions": median_field(
-                samples, "scheduler_adaptive_resident_decisions"
-            ),
-            "scheduler_adaptive_mixed_decisions": median_field(
-                samples, "scheduler_adaptive_mixed_decisions"
-            ),
-            "scheduler_adaptive_storage_decisions": median_field(
-                samples, "scheduler_adaptive_storage_decisions"
-            ),
-            "scheduler_adaptive_resident_observations": median_field(
-                samples, "scheduler_adaptive_resident_observations"
-            ),
-            "scheduler_adaptive_mixed_observations": median_field(
-                samples, "scheduler_adaptive_mixed_observations"
-            ),
-            "scheduler_adaptive_storage_observations": median_field(
-                samples, "scheduler_adaptive_storage_observations"
-            ),
-            "scheduler_adaptive_phase_changes": median_field(
-                samples, "scheduler_adaptive_phase_changes"
-            ),
-            "scheduler_adaptive_noisy_switch_rejections": median_field(
-                samples, "scheduler_adaptive_noisy_switch_rejections"
-            ),
-            "scheduler_cross_call_collected_batches": median_field(
-                samples, "scheduler_cross_call_collected_batches"
-            ),
-            "scheduler_cross_call_collected_requests": median_field(
-                samples, "scheduler_cross_call_collected_requests"
-            ),
-            "scheduler_cross_call_collection_probes": median_field(
-                samples, "scheduler_cross_call_collection_probes"
-            ),
-            "scheduler_cross_call_collection_timeouts": median_field(
-                samples, "scheduler_cross_call_collection_timeouts"
-            ),
-            "scheduler_cross_call_collection_bypasses": median_field(
-                samples, "scheduler_cross_call_collection_bypasses"
-            ),
-            "scheduler_cross_call_collection_wait_us": median_field(
-                samples, "scheduler_cross_call_collection_wait_us"
-            ),
-            "scheduler_cross_call_max_batch_size": median_field(
-                samples, "scheduler_cross_call_max_batch_size"
-            ),
-            "scheduler_cross_call_max_pending": median_field(
-                samples, "scheduler_cross_call_max_pending"
+            "scheduler_staged_decode_batches": median_field(
+                samples, "scheduler_staged_decode_batches"
             ),
             "expert_route_predictions": median_field(
                 samples, "expert_route_predictions"
@@ -2731,12 +2162,6 @@ def main():
             ),
             "expert_route_prediction_cache_misses": median_field(
                 samples, "expert_route_prediction_cache_misses"
-            ),
-            "expert_route_prediction_ms": median_field(
-                samples, "expert_route_prediction_ms"
-            ),
-            "expert_route_prediction_wait_ms": median_field(
-                samples, "expert_route_prediction_wait_ms"
             ),
             "expert_route_prediction_async_submissions": median_field(
                 samples, "expert_route_prediction_async_submissions"
@@ -2844,15 +2269,6 @@ def main():
             "expert_cache_io_worker_count": median_field(
                 samples, "expert_cache_io_worker_count"
             ),
-            "expert_cache_adaptive_io_workers": median_field(
-                samples, "expert_cache_adaptive_io_workers"
-            ),
-            "expert_cache_io_read_samples": median_field(
-                samples, "expert_cache_io_read_samples"
-            ),
-            "expert_cache_io_read_time_ms": median_field(
-                samples, "expert_cache_io_read_time_ms"
-            ),
             "expert_gpu_cache_hits": median_field(
                 samples, "expert_gpu_cache_hits"
             ),
@@ -2916,9 +2332,6 @@ def main():
             "expert_gpu_victim_cache_bytes_downloaded": median_field(
                 samples, "expert_gpu_victim_cache_bytes_downloaded"
             ),
-            "expert_gpu_victim_cache_restore_ms": median_field(
-                samples, "expert_gpu_victim_cache_restore_ms"
-            ),
             "expert_gpu_victim_cache_mapped_stores": median_field(
                 samples, "expert_gpu_victim_cache_mapped_stores"
             ),
@@ -2936,12 +2349,6 @@ def main():
             ),
             "expert_gpu_execution_failures": median_field(
                 samples, "expert_gpu_execution_failures"
-            ),
-            "expert_gpu_cpu_preferred": median_field(
-                samples, "expert_gpu_cpu_preferred"
-            ),
-            "expert_gpu_execution_ms": median_field(
-                samples, "expert_gpu_execution_ms"
             ),
             "expert_gpu_route_aggregation_batches": median_field(
                 samples, "expert_gpu_route_aggregation_batches"
@@ -3007,13 +2414,11 @@ def main():
         f"median generation: {median['generation_seconds']:.4f} s "
         f"({median['decode_tokens_per_second']:.3f} token/s)"
     )
-    print(f"median Expert time: {median['expert_ms']:.3f} ms")
     if median["expert_gpu_cache_hits"] is not None:
         print(
             "median GPU Expert execution cache: "
             f"{median['expert_gpu_cache_hits']:.0f} hit(s), "
-            f"{median['expert_gpu_executions']:.0f} execution(s), "
-            f"{median['expert_gpu_cpu_preferred']:.0f} CPU-preferred"
+            f"{median['expert_gpu_executions']:.0f} execution(s)"
         )
     if median["expert_gpu_route_aggregation_batches"] is not None:
         print(
@@ -3027,8 +2432,7 @@ def main():
         print(
             "median GPU Expert victim cache: "
             f"{median['expert_gpu_victim_cache_hits']:.0f} hit(s), "
-            f"{median['expert_gpu_victim_cache_misses']:.0f} miss(es), "
-            f"{median['expert_gpu_victim_cache_restore_ms']:.3f} ms restoring"
+            f"{median['expert_gpu_victim_cache_misses']:.0f} miss(es)"
         )
     if median["expert_gpu_device_source_hits"] is not None:
         print(

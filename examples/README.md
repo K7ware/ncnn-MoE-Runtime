@@ -25,28 +25,18 @@ directories or executables on `PATH`. On Windows its default worker path is
 `NCNN_MOE_WORKER=PATH` when a different build is intentionally selected.
 
 `ncnn_moe_worker` loads Runtime/Model once and accepts one JSON object per line
-on stdin. During startup it emits `init` progress events before `ready`, then
-emits `token`, `metrics`, `done`, and `error` events. Its
-native sessions contain token IDs and KV state only:
+on stdin. It emits `ready`, `token`, `metrics`, `done`, and `error` events. Its
+native sessions contain token IDs and KV state:
 
-- Python adapters provide the official tokenizer and chat template for each
-  model family.
-- Python session state provides messages, context budgeting, prefix reuse,
-  compaction, persistence, and continuous chat.
-- The worker provides model loading, native Session state, generation, reset,
-  cancellation, and runtime statistics.
+- Runtime owns the model's tokenizer, text-message template, stop IDs, and
+  incremental text decoding for all supported model families.
+- Python provides message history, summaries, compaction policy, persistence,
+  and reasoning/final presentation. It requires no model tokenizer package.
+- Worker validates context limits and reuses committed token prefixes, then
+  invokes Session generation, reset, cancellation, and runtime statistics.
 
-The Python CLI consumes the `init` events and renders a progress bar such as:
-
-```text
-Init [====================----]  83.3% · Preparing Expert storage and caches · 2.4s
-```
-
-The progress stages are public lifecycle descriptions (`hardware`, `manifest`,
-`architecture`, `memory`, `weights`, `compile`, `cache`, and `finalize`); they
-are not a promise about the exact number of internal operations. If loading
-fails, the last stage remains visible and the following `error` event contains
-the actionable failure.
+Text prompts require the supported tokenizer assets in the model directory.
+The CLI reports an unsupported text profile instead of falling back to Python.
 
 Use `inspect` before a run to see the detected CPU/Vulkan devices and effective
 resource plan; human-readable memory and I/O sizes are shown as decimal `GB`.
@@ -67,12 +57,13 @@ reduce routed-Expert storage and improve GPU residency; without it, the
 official file-backed BF16 Experts remain supported. Use `--cpu` for a CPU-only
 comparison.
 
-CPU Expert weight repacking is an explicit experiment. Pass
-`--cpu-packed-weights on` to enable it for supported MXFP4-Q8 or Qn_K weights;
-when the option is absent, the worker keeps repack off and does not reserve an
-in-memory packed sidecar.
+CPU weight repacking is opt-in. Pass
+`--cpu-packed-weights on` to enable it for supported MXFP4-Q8 or Qn_K weights.
+When the option is absent, the worker keeps repacking off and does not reserve
+an in-memory packed layout.
 
-The CLI is intentionally the only public text entry point. The four
+The CLI is the interactive text entry point; C++ consumers can use
+`Model::encode`, `Model::decode`, and `Model::stop_tokens`. The four
 model-named native executables (`ncnn_moe_gpt_oss`,
 `ncnn_moe_deepseek_v4`, `ncnn_moe_qwen3_6`, and `ncnn_moe_qwen3_8`) remain
 reference/benchmark
@@ -110,8 +101,8 @@ Runtime internals:
 metrics
   Prompt: 3.70 t/s | Generation: 7.30 t/s · TTFT 1.20 s · TPOT 250.00 ms
   Expert: cache hit 12 · cache miss 3 · IO 1.23 GB
-  CPU: expert compute 890.00 ms · process 759.1%
-  GPU: submit 42 · wait 12.00 ms · kernel 8.00 ms · utilization 4.0%
+  Process CPU: 759.1%
+  GPU: submit 42 · utilization 4.0%
 ```
 
 The JSONL payload also exposes `prompt_tokens_per_second` and
@@ -119,23 +110,17 @@ The JSONL payload also exposes `prompt_tokens_per_second` and
 `generation_tok_per_second` aliases) for internal benchmark tooling. It keeps
 exact microseconds and bytes for tooling. `IO` in the
 CLI is the Runtime's logical Expert-cache read volume, while process-level
-read/write counters remain under `process` for diagnostics. `GPU kernel time`
-is the Expert GPU backend wall time; Vulkan device timestamp queries are not
-assumed, so it is not presented as a complete device-wide kernel timeline.
-When the selected backend is CPU-only, GPU runtime counters are emitted as
-`null` with a reason rather than as zero-valued measurements.
+read/write counters remain under `process` for diagnostics.
 `Prompt` measures input-token prefill throughput until the first generated token
 is ready. `Generation` measures steady-state output throughput after that first
 token; it is also exposed under the compatibility field
 `decode_tokens_per_second`. `TTFT` uses the same prompt boundary and `TPOT`
 is the average interval for the remaining output tokens.
 
-The native public boundary is `RuntimeConfig`, token IDs, token-ID generation
-config, Session state, and the stable `SessionMetrics` view. The generic
-`SamplingOptions` controls distribution selection over token IDs; it does not
-own a tokenizer or chat policy. Tokenizers, chat templates, stop-policy
-selection, reasoning/final-channel decoding, conversation history, and
-human-readable formatting remain in the Python adapters and CLI.
+The native public boundary includes Model text encoding/decoding, `Option`,
+token IDs, generation controls, Session state, and `SessionMetrics`.
+`SamplingOptions` controls distribution selection over token IDs. Python
+retains conversation history and human-readable channel presentation.
 
 ## Optional Python dependencies
 
@@ -145,17 +130,13 @@ For a complete local Example setup, run this from the repository root:
 python -m pip install -r requirements.txt
 ```
 
-This installs all supported adapter, model-download, Qwen artifact-build, TUI,
-and telemetry dependencies. The DeepSeek-V4 `encoding/encoding_dsv4.py` file
-is supplied by the checkpoint and is self-contained; the ncnn Runtime CLI does
-not require the model repository's PyTorch inference stack. The minimal and
-grouped installations remain available when a smaller environment is
-preferred:
+This installs model-download, Qwen artifact-build, TUI, and telemetry tools.
+The CLI no longer loads the checkpoint's Python encoding script or any Python
+tokenizer package. Smaller installations remain available:
 
 ```powershell
 python -m pip install -e .
 python -m pip install -e ".[tui]"
-python -m pip install -e ".[gpt-oss]"
 python -m pip install -e ".[hf]"
 python -m pip install -e ".[telemetry]"
 ```
@@ -182,5 +163,5 @@ runtime Expert/GPU caches remain process-local and are not written to disk.
 
 For the JSONL operation schema, see
 `tools/ncnn_moe_protocol.py` and the native implementation in
-`examples/ncnn_moe_worker.cpp`. The native boundary deliberately does not
-contain tokenizer or model-family chat logic.
+`examples/ncnn_moe_worker.cpp`. Private tokenizer and template handling live
+in `src/models/tokenizer.cpp` and are loaded with the Model.
